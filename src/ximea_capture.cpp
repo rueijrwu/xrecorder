@@ -58,7 +58,8 @@ bool XimeaCapture::Open() {
     // backlog lives in the application's per-lane pools after ownership copy.
     // At 2048x1024 this is ~130 MiB instead of the previous ~304 MiB.
     constexpr int kAcqBufferFrames = 64;
-    constexpr int kQueueFrames = 64;
+    // This camera reports XI_PRM_BUFFERS_QUEUE_SIZE valid range 2..63.
+    constexpr int kQueueFrames = 63;
     const int requested_acq_buffer_size = payload_size * kAcqBufferFrames;
 
     // ACQ_BUFFER_SIZE must be set before BUFFERS_QUEUE_SIZE because XiAPI can
