@@ -24,17 +24,13 @@
 // Pipeline: appsrc(CUDAMemory NV12) ! nvh264enc ! h264parse ! appsink
 //
 // Frames are submitted already converted to NV12 in an application-owned
-// GPU buffer belonging to this lane's own bounded pool (see RECORD.md
-// "Remove unnecessary local GRAY8 copy" / "Avoid the current 1000-frame
-// recorder pool design"). The lane never muxes or writes to disk; encoded
-// access units are handed to a caller-supplied callback in submission
-// order for the OrderedBitstreamSerializer to consume.
+// GPU buffer belonging to this lane's own bounded pool. The lane never
+// muxes or writes to disk; encoded access units are handed to a caller-
+// supplied callback in submission order for OrderedBitstreamSerializer.
 //
-// The caller (MultiNvRecorder) is responsible for launching the GRAY8->NV12
-// conversion kernel that fills a reserved slot, on the stream returned by
-// ConvertStream() (which runs in this lane's GPU context) — this keeps the
-// capture-adjacent path non-blocking: SubmitSlot only records an event and
-// enqueues, it never waits on the GPU.
+// MultiNvRecorder launches GRAY8->NV12 on ConvertStream(). Each lane owns a
+// distinct non-blocking CUDA process stream so the three preparation/encode
+// pipelines can progress independently.
 class EncoderLane {
 public:
     using ErrorCallback = std::function<void(const std::string& error_msg)>;
@@ -47,7 +43,7 @@ public:
         int height = 992;
         int fps = 1000;
         int gop_size = 30;
-        int pool_size = 48;       // bounded NV12 slots (see RECORD.md pool sizing)
+        int pool_size = 48;
         uint32_t bitrate_kbps = 100000;
     };
 
@@ -68,17 +64,16 @@ public:
     bool Start(ChunkCallback chunk_cb, ErrorCallback error_cb = nullptr);
     void Stop();
 
-    // Returns a pool slot's GPU (NV12) pointer to convert INTO for the given
-    // frame, or nullptr if the lane's bounded pool is saturated (caller must
-    // treat this as a drop — the capture path must never block on backlog).
+    // Returns a pool slot's GPU NV12 pointer, or nullptr if this lane is
+    // saturated. The capture path must never block on lane backlog.
     void* ReserveSlot(int* out_slot_index);
+    void CancelReservedSlot(int slot_index) { ReleaseSlot(slot_index); }
     cudaStream_t ConvertStream() const { return convert_stream_; }
 
     // Submits a previously reserved+filled slot. `force_idr` must be true
-    // for the first frame of every GOP this lane encodes so independently
-    // scheduled GOPs remain independently decodable.
+    // for the first successfully submitted frame of each independent GOP.
     void SubmitSlot(int slot_index, uint64_t gop_index, uint64_t source_index,
-                     uint64_t pts_ns, bool force_idr);
+                    uint64_t pts_ns, bool force_idr);
 
     int gpu_id() const { return cfg_.gpu_id; }
     int lane_id() const { return cfg_.lane_id; }
@@ -122,8 +117,6 @@ private:
     std::atomic<bool> pipeline_failed_{false};
     mutable std::mutex stop_mutex_;
 
-    // Bounded application-owned NV12 pool for this lane (RECORD.md warns
-    // against the old 1000-slot GRAY8+NV12 pool design).
     std::vector<void*> nv12_pool_;
     std::vector<std::atomic<bool>> slot_in_use_;
     std::vector<cudaEvent_t> pool_events_;
@@ -134,9 +127,6 @@ private:
     std::mutex submit_mutex_;
     std::condition_variable submit_cv_;
 
-    // FIFO of (gop_index, source_index, pts) for frames pushed to appsrc, in
-    // submission order, so appsink output (which GStreamer preserves in
-    // order for a single appsrc/appsink pipeline) can be re-tagged.
     std::mutex pending_mutex_;
     std::deque<std::tuple<uint64_t, uint64_t, uint64_t>> pending_frames_;
 
