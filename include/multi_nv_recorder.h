@@ -17,17 +17,24 @@
 
 // Top-level multi-lane NVENC recorder (RECORD.md "Recommended Architecture").
 //
-//   XIMEA @ 1000 fps (GPUDirect -> capture GPU)
+// Intended two-GPU deployment:
+//
+//   XIMEA @ 1000 fps (GPUDirect -> RTX PRO capture GPU)
 //         |
-//         +--> EncoderLane 0 (e.g. 5070 Ti) --+
-//         +--> EncoderLane 1 (e.g. 5070 Ti) --+--> OrderedBitstreamSerializer --> one MKV
-//         +--> EncoderLane 2 (e.g. PRO 2000) -+
+//         +--> EncoderLane 0 (RTX PRO, local) --------+
+//         +--P2P--> EncoderLane 1 (RTX 5070 Ti) ------+--> OrderedBitstreamSerializer --> one MKV
+//         +--P2P--> EncoderLane 2 (RTX 5070 Ti) ------+
 //
 // GOPs (not individual frames) are scheduled to lanes. Frames destined for
 // a lane on a different GPU than the capture GPU get a GRAY8 P2P/staged
 // cross-GPU copy before conversion; frames destined for a lane on the
 // capture GPU are converted directly from the XIMEA GPUDirect pointer with
 // no intermediate copy.
+//
+// Remote transfer resources are owned PER LANE, not per destination GPU.
+// This is required when multiple encoder lanes share one remote GPU: both
+// lanes can reserve the same local slot index concurrently, so sharing a
+// single GRAY8 staging ring by gpu_id would corrupt frames.
 class MultiNvRecorder {
 public:
     using ErrorCallback = std::function<void(const std::string& error_msg)>;
@@ -76,13 +83,15 @@ public:
 
 private:
     struct RemoteTransfer {
+        int gpu_id = -1;
         bool peer_ok = false;
-        std::vector<void*> gray8_staging;      // on lane's GPU
+        std::vector<void*> gray8_staging;       // on this lane's GPU
         std::vector<void*> pinned_staging;      // host, only used if !peer_ok
-        std::vector<cudaEvent_t> xfer_events;   // only used if !peer_ok
+        std::vector<cudaEvent_t> xfer_events;   // capture-GPU events, only if !peer_ok
     };
 
-    void SetupRemoteTransfer(int lane_gpu_id);
+    void SetupRemoteTransfer(int lane_id, int lane_gpu_id);
+    void BuildSerializer();
 
     Config cfg_;
     std::string output_path_;
@@ -92,7 +101,9 @@ private:
     std::unique_ptr<GopScheduler> scheduler_;
     std::unique_ptr<OrderedBitstreamSerializer> serializer_;
 
-    std::map<int, RemoteTransfer> remote_transfers_;  // keyed by lane gpu_id
+    // Keyed by lane_id, deliberately NOT by gpu_id. Two lanes on the same
+    // RTX 5070 Ti must have independent GRAY8 staging ownership.
+    std::map<int, RemoteTransfer> remote_transfers_;
     cudaStream_t capture_xfer_stream_ = nullptr;
     size_t gray8_size_ = 0;
 

@@ -36,7 +36,7 @@ struct CameraConfig {
     float gain_db = -1.0f; // -1 for max
     int offset_x = 0;
     int offset_y = 0;
-    int gpu_id = 0;  // GPU the XIMEA GPUDirect frames land on
+    int gpu_id = 0;  // Must identify the XIMEA GPUDirect-capable GPU (RTX PRO 2000 in target rig)
 };
 
 struct LaneConfig {
@@ -48,9 +48,9 @@ struct RecorderConfig {
     int gop_size = 30;
     int pool_size_per_lane = 48;
     uint32_t max_queue_depth = 16;
-    // Empty => XimeaManager auto-detects GPUs and builds a default lane set
-    // matching RECORD.md (two lanes on the capture GPU, one on the second
-    // GPU if present).
+    // Empty => XimeaManager builds the target topology: one local lane on
+    // the capture/RTX PRO GPU and two remote lanes on the second/5070 Ti GPU.
+    // Override explicitly with --lane-gpus if CUDA device enumeration differs.
     std::vector<LaneConfig> lanes;
 };
 

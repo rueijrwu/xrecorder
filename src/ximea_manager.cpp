@@ -33,17 +33,31 @@ bool XimeaManager::Initialize(int save_fps, int display_fps, const std::string& 
     rec_cfg_ = rec_cfg;
 
     if (rec_cfg_.lanes.empty()) {
-        // Default lane placement matches RECORD.md: two lanes on the
-        // capture GPU (e.g. RTX 5070 Ti, 2 NVENC engines), one lane on the
-        // second GPU (e.g. RTX PRO 2000) if present.
+        // Target rig topology after GPUDirect audit:
+        //   capture GPU = RTX PRO 2000 (XIMEA GPUDirect landing GPU, 1 NVENC)
+        //   other GPU   = RTX 5070 Ti (2 NVENC engines)
+        // Thus the default is one local lane plus two remote lanes.
         int device_count = 0;
         cudaGetDeviceCount(&device_count);
         int capture_gpu = cam_cfg.gpu_id;
+        if (capture_gpu < 0 || capture_gpu >= device_count) {
+            std::cerr << "XimeaManager: invalid capture GPU id " << capture_gpu
+                      << "; use --capture-gpu to select the RTX PRO 2000." << std::endl;
+            return false;
+        }
         if (device_count >= 2) {
-            int other_gpu = (capture_gpu == 0) ? 1 : 0;
-            rec_cfg_.lanes = {{capture_gpu, 1.0}, {capture_gpu, 1.0}, {other_gpu, 1.0}};
+            int other_gpu = -1;
+            for (int i = 0; i < device_count; ++i) {
+                if (i != capture_gpu) {
+                    other_gpu = i;
+                    break;
+                }
+            }
+            rec_cfg_.lanes = {{capture_gpu, 1.0}, {other_gpu, 1.0}, {other_gpu, 1.0}};
         } else {
-            rec_cfg_.lanes = {{capture_gpu, 1.0}, {capture_gpu, 1.0}};
+            // A single-GPU deployment remains functional, but cannot use the
+            // intended aggregate 3-NVENC topology.
+            rec_cfg_.lanes = {{capture_gpu, 1.0}};
         }
     }
 
