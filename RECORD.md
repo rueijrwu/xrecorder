@@ -7,7 +7,7 @@
 - **RTX PRO 2000 Blackwell**: XIMEA GPUDirect landing GPU + 1 NVENC lane
 - **RTX 5070 Ti**: 2 NVENC lanes
 
-The throughput invariant is:
+The key throughput invariant is:
 
 ```text
 one new camera frame every 1 ms
@@ -15,33 +15,70 @@ one new camera frame every 1 ms
 one frame must finish encoding within 1 ms
 ```
 
-Three independent encoder pipelines provide aggregate throughput while the serializer restores source order.
+The implementation is intentionally a **four-concurrent-path system**:
+
+```text
+1 capture/RDMA + ownership-copy path
+3 independent processing/encoding pipelines
+```
+
+The capture path synchronizes only at the ownership-copy boundary. It never waits for GRAY8→NV12 conversion or NVENC completion.
+
+---
+
+# Four-concurrent-path architecture
+
+```text
+Camera @ 1000 fps
+      |
+      | XiAPI GPUDirect RDMA
+      v
+XiAPI-owned GRAY8 in RTX PRO 2000 VRAM
+      |
+      | one ownership copy for the selected lane
+      | capture waits ONLY for copy_done
+      v
+lane-owned GRAY8
+      |
+      +----------------------+----------------------+
+      |                      |                      |
+      v                      v                      v
+PRO pipeline            5070 pipeline A       5070 pipeline B
+process stream 0        process stream 1      process stream 2
+GRAY8 -> NV12           GRAY8 -> NV12         GRAY8 -> NV12
+      |                      |                      |
+      v                      v                      v
+PRO NVENC               5070 NVENC A          5070 NVENC B
+      |                      |                      |
+      +----------------------+----------------------+
+                             |
+                             v
+                  OrderedBitstreamSerializer
+                             |
+                             v
+                        one H.264/MKV
+```
+
+At steady state, a representative overlap is:
+
+```text
+capture/copy : frame N
+PRO pipeline : older GOP/frame work
+5070 lane A  : older GOP/frame work
+5070 lane B  : older GOP/frame work
+```
+
+The only host-side synchronization on the capture path is:
+
+```cpp
+cudaEventSynchronize(copy_done);
+```
+
+After `copy_done`, the XiAPI RDMA pointer is no longer needed by the recorder.
 
 ---
 
 # Hardware topology
-
-```text
-XIMEA @ 1000 fps
-      |
-      | XiAPI GPUDirect
-      v
-RTX PRO 2000 VRAM
-      |
-      +--> PRO lane 0: GRAY8 -> NV12 -> PRO NVENC
-      |
-      +-- GRAY8 GPU copy --> RTX 5070 Ti --> lane 1 -> NVENC A
-      |
-      +-- GRAY8 GPU copy --> RTX 5070 Ti --> lane 2 -> NVENC B
-
-three independent GOP streams
-      |
-      v
-OrderedBitstreamSerializer
-      |
-      v
-single H.264/MKV recording
-```
 
 Default topology:
 
@@ -57,6 +94,185 @@ CUDA device enumeration is machine-dependent. Example when the 5070 Ti is device
 ```bash
 ximea_cli --capture-gpu 1 --lane-gpus 1,0,0
 ```
+
+The RTX 5070 Ti is not used as the XiAPI GPUDirect landing GPU. The camera lands in PRO 2000 VRAM; frames assigned to the 5070 Ti are copied there before processing.
+
+---
+
+# Ownership boundary: every lane copies first
+
+The XiAPI capture path uses:
+
+```text
+XI_PRM_TRANSPORT_DATA_TARGET = GPU_RAM
+XI_PRM_IMAGE_DATA_FORMAT     = XI_FRM_TRANSPORT_DATA
+XI_PRM_BUFFER_POLICY         = XI_BP_UNSAFE
+```
+
+`image.bp` points to XiAPI-managed GPU memory. That memory can be reused by the acquisition ring, so no processing pipeline is allowed to consume `image.bp` directly.
+
+Every frame follows the same rule:
+
+```text
+XiAPI RDMA pointer
+      |
+      | COPY ONLY
+      v
+lane-owned GRAY8 slot
+      |
+      | copy_done
+      +---- capture may release/return to XiAPI here
+      |
+      v
+lane-owned processing begins independently
+```
+
+This applies even to the local PRO lane.
+
+Old local optimization — no longer used:
+
+```text
+XiAPI GRAY8 -> direct GRAY8->NV12 conversion
+```
+
+Current local PRO path:
+
+```text
+XiAPI GRAY8 in PRO VRAM
+      |
+      | D2D ownership copy
+      v
+PRO lane-owned GRAY8
+      |
+      | capture waits copy_done only
+      v
+PRO process stream: GRAY8 -> NV12 -> NVENC
+```
+
+Remote 5070 path:
+
+```text
+XiAPI GRAY8 in PRO VRAM
+      |
+      | P2P ownership copy
+      v
+5070 lane-owned GRAY8
+      |
+      | capture waits copy_done only
+      v
+5070 process stream: GRAY8 -> NV12 -> NVENC
+```
+
+The extra local D2D copy is intentional. It creates one clean and identical ownership boundary for all lanes and completely decouples XiAPI buffer lifetime from conversion/NVENC latency.
+
+---
+
+# Copy streams versus process streams
+
+Each lane has **two conceptual stages**:
+
+```text
+copy stage
+process/encode stage
+```
+
+Each lane owns an independent non-blocking copy stream and an independent non-blocking process stream.
+
+For lane `i`:
+
+```text
+copy_stream[i]
+    |
+    | ownership copy into lane GRAY8
+    v
+copy_done[i][slot]
+    |
+    | host capture waits here and nowhere later
+    v
+process_stream[i]
+    |
+    | GRAY8 -> NV12
+    v
+NVENC pipeline i
+```
+
+`EncoderLane::convert_stream_` is the lane process stream and is created with:
+
+```cpp
+cudaStreamCreateWithFlags(&convert_stream_, cudaStreamNonBlocking);
+```
+
+The copy streams are also created with `cudaStreamNonBlocking`.
+
+This prevents legacy default-stream synchronization from coupling independent lanes.
+
+CUDA current-device state is thread-local, so each encoder worker thread explicitly binds its own GPU before touching lane CUDA objects.
+
+---
+
+# Local and P2P copy paths
+
+For the local PRO lane:
+
+```text
+PRO XiAPI RDMA memory
+      |
+      | cudaMemcpyAsync D2D on lane 0 copy stream
+      v
+PRO lane-owned GRAY8
+```
+
+For a remote 5070 lane with peer access:
+
+```text
+PRO XiAPI RDMA memory
+      |
+      | cudaMemcpyPeerAsync on that lane's copy stream
+      v
+5070 lane-owned GRAY8
+```
+
+The destination GPU is current for the P2P submission because the copy stream belongs to the destination lane GPU.
+
+Direct peer access is checked/enabled per destination lane GPU.
+
+---
+
+# Pinned-host fallback
+
+If direct CUDA P2P is unavailable, the ownership copy becomes:
+
+```text
+PRO VRAM
+   |
+   | D2H async on this lane's capture-side stream
+   v
+lane-owned pinned host slot
+   |
+   | destination copy stream waits for d2h_done
+   | H2D async
+   v
+5070 lane-owned GRAY8
+   |
+   | copy_done
+   v
+process pipeline
+```
+
+Capture still performs only one host synchronization: the final `copy_done` event representing completion of the full ownership transfer into destination GPU memory.
+
+Each remote lane owns its own:
+
+```text
+capture-side fallback stream
+pinned-host ring
+d2h_done events
+destination copy stream
+GRAY8 ring
+copy_done events
+```
+
+Therefore the two 5070 pipelines do not serialize through shared fallback resources.
 
 ---
 
@@ -75,160 +291,72 @@ If the two 5070 lanes process approximately two-thirds of the GOPs:
 PRO -> 5070 GRAY8 traffic ~= 2.71 GB/s
 ```
 
-The copy must happen before NV12 expansion. Copying NV12 would increase traffic by 1.5×.
-
-Preferred path:
-
-```text
-XiAPI GRAY8 in PRO VRAM
-      |
-      | cudaMemcpyPeerAsync
-      v
-owned GRAY8 staging in 5070 VRAM
-      |
-      | GRAY8 -> NV12 CUDA kernel
-      v
-owned NV12 encoder slot
-      |
-      v
-NVENC
-```
-
-Fallback when P2P is unavailable:
-
-```text
-PRO VRAM
-   |
-   | D2H async on this lane's capture-side stream
-   v
-pinned host staging
-   |
-   | H2D async
-   v
-5070 VRAM
-```
-
-P2P availability still depends on CUDA support and motherboard/PCIe topology.
+The ownership copy happens while the image is still GRAY8. Copying NV12 would increase cross-GPU traffic by 1.5×.
 
 ---
 
-# Per-pipeline CUDA streams
+# Per-lane memory ownership
 
-Every encoder pipeline must be independently schedulable.
+Every lane now owns a GRAY8 staging ring, not only remote lanes.
 
-Each `EncoderLane` owns:
-
-```text
-one NVENC/GStreamer pipeline
-one bounded NV12 pool
-one CUDA conversion/preparation stream
-one push thread
-one pull thread
-```
-
-`EncoderLane::convert_stream_` is created with:
-
-```cpp
-cudaStreamCreateWithFlags(&convert_stream_, cudaStreamNonBlocking);
-```
-
-This avoids legacy default-stream synchronization coupling otherwise independent lanes.
-
-For P2P operation:
+Each lane therefore owns:
 
 ```text
-lane 1 P2P copy -> lane 1 ConvertStream -> lane 1 conversion -> lane 1 NVENC
-lane 2 P2P copy -> lane 2 ConvertStream -> lane 2 conversion -> lane 2 NVENC
+48 GRAY8 staging slots
+48 NV12 encoder slots
+per-slot copy_done events
+one copy stream
+one process stream
+one independent NVENC/GStreamer pipeline
 ```
 
-For pinned-host fallback, each remote lane also owns a separate capture-GPU stream:
+At 4096×992:
 
 ```text
-lane 1 capture_stream -> pinned A -> lane 1 ConvertStream
-lane 2 capture_stream -> pinned B -> lane 2 ConvertStream
+GRAY8 frame ~= 4.063 MB
+48 GRAY8 slots ~= 195 MB per lane
+
+NV12 frame ~= 6.095 MB
+48 NV12 slots ~= 293 MB per lane
 ```
 
-There is no shared `capture_xfer_stream_` between the two 5070 pipelines.
-
-CUDA current-device state is thread-local, so each `EncoderLane::PushLoop()` explicitly executes:
-
-```cpp
-cudaSetDevice(cfg_.gpu_id);
-```
-
-before touching that lane's CUDA events or CUDA-backed GStreamer memory.
-
----
-
-# Remote staging ownership
-
-Remote GRAY8 staging is **per encoder lane**, not per destination GPU.
-
-Unsafe:
+Approximate application-owned GPU staging across three lanes:
 
 ```text
-remote_transfers_[gpu_id].gray8_staging[slot]
+3 × (195 MB + 293 MB) ~= 1.46 GB
 ```
 
-because both 5070 lanes can simultaneously reserve the same slot number.
+This is deliberate and replaces dependence on XiAPI memory after the ownership copy.
 
-Correct:
-
-```text
-remote_transfers_[lane_id].gray8_staging[slot]
-```
-
-Each remote lane has an independent GRAY8 ring, pinned-host fallback ring, CUDA events, and fallback transfer stream.
-
-With 48 slots:
-
-```text
-~195 MB GRAY8 staging per remote lane
-~390 MB total for two 5070 lanes
-```
+The old 1000-frame recorder pool is not used by the multi-NVENC path.
 
 ---
 
 # Authoritative frame identity: acq_nframe
 
-`XI_IMG::acq_nframe` is now the authoritative recorder sequence, not just a camera telemetry field.
+`XI_IMG::acq_nframe` is the authoritative recorder sequence.
 
-The old behavior was wrong:
-
-```text
-source_index = source_index_++
-```
-
-because a missing camera frame was silently removed from the recorder timeline.
-
-The current behavior derives recording-relative source position from successive `acq_nframe` deltas:
-
-```text
-first actual frame             -> source_index 0
-next acq_nframe + 1            -> source_index +1
-next acq_nframe + N            -> source_index +N
-missing camera frames remain missing source indices
-```
-
-Unsigned `uint32_t` subtraction is used for the delta, so the normal XiAPI frame-counter wrap is handled naturally. A zero delta is treated as a duplicate, and an implausibly large backward/reset delta is rejected rather than interpreted as billions of missing frames.
+Recording-relative `source_index` advances by the actual unsigned `acq_nframe` delta rather than by a dense `source_index_++` counter.
 
 Example:
 
 ```text
-acq_nframe:  100, 101, 104, 105
-source_index:  0,   1,   4,   5
-missing:                 2,3
+acq_nframe:   100  101  104  105
+source_index:   0    1    4    5
+missing:                  2,3
 ```
 
-The missing source positions are registered with the serializer immediately.
+Missing camera positions remain missing in the recorder timeline and are registered with the serializer immediately.
+
+Normal uint32 frame-counter wrap is handled by unsigned subtraction. Duplicate or implausibly backward/reset sequences are rejected.
 
 ---
 
 # Gap-aware GOP bookkeeping
 
-Camera-side gaps may occur before the first actual frame of a GOP. Therefore the serializer no longer stores only one mutable `expected` counter.
+Camera-side gaps can occur before the first actual frame of a GOP.
 
-Each pending GOP stores:
+Each pending GOP therefore tracks:
 
 ```text
 nominal_expected
@@ -243,17 +371,13 @@ Effective completion count is:
 expected_chunks = nominal_expected - explicit_dropped
 ```
 
-This allows a camera gap to be registered before the first actual frame of that GOP arrives.
-
-Large acquisition gaps are split by GOP boundaries rather than processed one missing frame at a time, keeping capture-thread work proportional to the number of GOPs crossed.
-
-The serializer counts explicit camera/application drops in `frame_gaps`, while additional chunks that disappear later in the encode path are detected separately by the stall logic.
+Large camera gaps are split by GOP boundary rather than processed frame-by-frame.
 
 ---
 
 # GOP assignment and IDR behavior
 
-Whole GOPs are assigned to lanes; individual inter-predicted frames are not round-robin distributed across encoders.
+Whole GOPs are scheduled to lanes.
 
 ```text
 GOP 0 -> lane 0
@@ -263,91 +387,83 @@ GOP 3 -> lane 0
 ...
 ```
 
-The route state is:
+Per-GOP route state is:
 
 ```text
 gop -> { lane_idx, needs_idr }
 ```
 
-The first **successfully submitted actual frame** of each GOP is forced to a keyframe/IDR.
+The first **successfully submitted actual frame** of each GOP gets the forced keyframe/IDR request.
 
-This matters when:
-
-- the nominal GOP-boundary camera frame is missing; or
-- the first actual frame cannot reserve an encoder slot.
-
-`needs_idr` is cleared only after successful submission, so the next actual frame still receives the IDR request if the previous one was dropped.
+If the nominal GOP-start frame is missing, or the first actual frame cannot reserve a lane slot, `needs_idr` remains true for the next actual frame.
 
 ---
 
-# XiAPI buffer ownership
+# Capture critical path
 
-The capture path uses:
-
-```text
-XI_PRM_TRANSPORT_DATA_TARGET = GPU_RAM
-XI_PRM_IMAGE_DATA_FORMAT     = XI_FRM_TRANSPORT_DATA
-XI_PRM_BUFFER_POLICY         = XI_BP_UNSAFE
-```
-
-`image.bp` is XiAPI-owned GPU memory and may later be reused by the acquisition ring.
-
-Ownership handoff must therefore happen immediately:
+Conceptually, one capture callback now performs only:
 
 ```text
-local PRO lane:
-XiAPI GRAY8 -> lane NV12 slot
-
-remote 5070 lane:
-XiAPI GRAY8 -> lane-owned 5070 GRAY8 staging -> lane NV12 slot
+xiGetImage already returned image.bp
+      |
+read acq_nframe + timestamp
+      |
+choose/lookup GOP lane
+      |
+reserve lane slot
+      |
+submit ownership copy
+      |
+WAIT ONLY FOR copy_done
+      |
+enqueue GRAY8->NV12 on lane process stream
+      |
+submit lane descriptor
+      |
+return to XiAPI
 ```
 
-NVENC must never depend on the XiAPI pointer for the complete encode lifetime.
-
-XiAPI acquisition configuration order remains:
+It does **not** wait for:
 
 ```text
-1. XI_PRM_ACQ_BUFFER_SIZE
-2. XI_PRM_BUFFERS_QUEUE_SIZE
-3. read both values back and verify them
+GRAY8->NV12 completion
+GStreamer appsrc consumption
+NVENC completion
+ordered serialization
+disk output
 ```
+
+This is the central real-time design invariant.
 
 ---
 
-# Memory model
+# Serializer
 
-The old 1000-frame GRAY8 + NV12 recorder pool is not used by the multi-NVENC path.
+Each encoder lane ends in `appsink`. Encoded access units are tagged with GOP and source identity and sent to `OrderedBitstreamSerializer`.
 
-Default per-lane pool:
-
-```text
-48 NV12 slots
-```
-
-At 4096×992:
-
-```text
-NV12 frame ~= 6.095 MB
-48-slot NV12 pool ~= 293 MB per lane
-```
-
-Remote lanes additionally own 48 GRAY8 staging slots each.
-
-Pools are bounded so encoder backlog cannot grow without limit.
-
----
-
-# Serializer lifecycle
-
-A new `OrderedBitstreamSerializer` is built for every recording session so `SetOutputName()` is honored and stopped GStreamer state is not reused.
-
-Encoded GOPs from all lanes are emitted in source order into one final pipeline:
+The serializer emits completed GOPs in source order into:
 
 ```text
 encoded appsrc -> h264parse -> matroskamux -> filesink
 ```
 
-Within each completed GOP, chunks are explicitly sorted by `source_index` before final emission.
+Within a GOP, chunks are explicitly ordered by `source_index` before emission.
+
+A new serializer is built for every recording session so indexed output filenames are honored and stopped GStreamer state is not reused.
+
+---
+
+# XiAPI configuration
+
+Acquisition configuration order remains:
+
+```text
+1. XI_PRM_ACQ_BUFFER_SIZE
+2. XI_PRM_BUFFERS_QUEUE_SIZE
+3. read both values back and verify accepted values
+```
+
+The XiAPI ring is only a short acquisition-jitter buffer. It is not the encoder backlog.
 
 ---
 
@@ -360,19 +476,20 @@ Baseline implementation commits audited:
 55246af2cdd90f7e811824abdd680464c6d1c8b4
 ```
 
-Important fixes made after that audit:
+Important fixes since that audit:
 
 1. Capture topology changed to PRO 2000 -> 5070 Ti copies.
 2. Default lanes changed to one PRO lane + two 5070 lanes.
 3. Remote staging changed from per-GPU to per-lane ownership.
-4. Destination CUDA device is made current before P2P submission.
-5. Serializer is rebuilt for every recording session.
-6. `acq_nframe` now controls recording-relative source sequence and GOP identity.
-7. Camera gaps are explicitly registered with the serializer.
-8. Missing nominal GOP-start frames still produce an IDR on the first actual frame.
-9. Every lane has an independent non-blocking CUDA preparation stream.
-10. Every remote fallback pipeline has an independent capture-side transfer stream.
-11. Encoder worker threads explicitly bind their CUDA device.
+4. Serializer is rebuilt for every recording session.
+5. `acq_nframe` now controls recorder source identity and gap bookkeeping.
+6. Missing nominal GOP-start frames still force an IDR on the first actual submitted frame.
+7. Every process pipeline owns a non-blocking CUDA process stream.
+8. Every lane now also owns a distinct non-blocking copy stream.
+9. Pinned-host fallback resources are per remote lane.
+10. The local PRO lane now performs an explicit D2D ownership copy instead of reading XiAPI memory directly.
+11. Capture synchronizes only the ownership-copy completion event.
+12. Conversion and NVENC lifetime are fully decoupled from XiAPI buffer lifetime.
 
 ---
 
@@ -381,8 +498,10 @@ Important fixes made after that audit:
 The implementation still requires real hardware validation for:
 
 - actual CUDA device IDs for PRO 2000 and 5070 Ti;
-- PRO -> 5070 P2P availability and measured bandwidth;
-- sustained throughput of each of the three NVENC sessions;
+- PRO -> 5070 direct P2P availability;
+- ownership-copy latency and its p99/p99.9 relative to the 1 ms capture period;
+- sustained throughput of all three NVENC sessions;
+- proof in Nsight Systems that capture/copy overlaps all three processing pipelines;
 - scheduler weight tuning;
 - long-duration 1000 fps zero-gap testing;
 - true NVENC completion-latency measurement;
@@ -395,19 +514,20 @@ The current lane latency metric is not yet full NVENC completion latency.
 # Success criteria
 
 ```text
-camera acquisition       = 1000 fps
-camera acq_nframe gaps   = 0 in a successful run
-application drops        = 0
-serializer frame gaps    = 0
-serializer GOP gaps      = 0
-final frame order        = exact
-all queues               = bounded
-three encoder pipelines  = concurrent
-PRO -> 5070 transfers    = stable
-aggregate NVENC capacity > 1000 fps with useful margin
+camera acquisition        = 1000 fps
+capture copy handoff      < 1 ms sustained, with margin
+camera acq_nframe gaps    = 0 in a successful run
+application drops         = 0
+serializer frame gaps     = 0
+serializer GOP gaps       = 0
+final frame order         = exact
+all queues                = bounded
+capture + 3 pipelines     = concurrent
+PRO -> 5070 transfers     = stable
+aggregate NVENC capacity  > 1000 fps with useful margin
 ```
 
-Preferred aggregate capacity remains approximately:
+Preferred aggregate encode capacity remains approximately:
 
 ```text
 1150-1250 fps or higher
