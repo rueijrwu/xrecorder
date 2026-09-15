@@ -15,7 +15,12 @@ PYBIND11_MODULE(ximea_py, m) {
         .def_readonly("rec_encoded", &XimeaTelemetry::rec_encoded)
         .def_readonly("rec_dropped", &XimeaTelemetry::rec_dropped)
         .def_readonly("rec_queue", &XimeaTelemetry::rec_queue)
-        .def_readonly("prev_displayed", &XimeaTelemetry::prev_displayed);
+        .def_readonly("prev_displayed", &XimeaTelemetry::prev_displayed)
+        .def_readonly("rec_cross_gpu_frames", &XimeaTelemetry::rec_cross_gpu_frames)
+        .def_readonly("rec_pending_gops", &XimeaTelemetry::rec_pending_gops)
+        .def_readonly("rec_gop_gaps", &XimeaTelemetry::rec_gop_gaps)
+        .def_readonly("rec_frame_gaps", &XimeaTelemetry::rec_frame_gaps)
+        .def_readonly("rec_bytes_written", &XimeaTelemetry::rec_bytes_written);
 
     py::class_<CameraConfig>(m, "CameraConfig")
         .def(py::init<>())
@@ -24,16 +29,30 @@ PYBIND11_MODULE(ximea_py, m) {
         .def_readwrite("exposure_us", &CameraConfig::exposure_us)
         .def_readwrite("gain_db", &CameraConfig::gain_db)
         .def_readwrite("offset_x", &CameraConfig::offset_x)
-        .def_readwrite("offset_y", &CameraConfig::offset_y);
+        .def_readwrite("offset_y", &CameraConfig::offset_y)
+        .def_readwrite("gpu_id", &CameraConfig::gpu_id);
+
+    py::class_<LaneConfig>(m, "LaneConfig")
+        .def(py::init<>())
+        .def_readwrite("gpu_id", &LaneConfig::gpu_id)
+        .def_readwrite("weight", &LaneConfig::weight);
+
+    py::class_<RecorderConfig>(m, "RecorderConfig")
+        .def(py::init<>())
+        .def_readwrite("gop_size", &RecorderConfig::gop_size)
+        .def_readwrite("pool_size_per_lane", &RecorderConfig::pool_size_per_lane)
+        .def_readwrite("max_queue_depth", &RecorderConfig::max_queue_depth)
+        .def_readwrite("lanes", &RecorderConfig::lanes);
 
     py::class_<XimeaManager>(m, "XimeaManager")
         .def(py::init<>())
-        .def("initialize", &XimeaManager::Initialize, 
-             py::arg("save_fps") = 1000, 
+        .def("initialize", &XimeaManager::Initialize,
+             py::arg("save_fps") = 1000,
              py::arg("display_fps") = 60,
              py::arg("codec") = "h264",
              py::arg("cam_cfg") = CameraConfig(),
-             "Initialize the camera with target FPS for saving, display, codec, and camera settings.")
+             py::arg("rec_cfg") = RecorderConfig(),
+             "Initialize the camera with target FPS for saving, display, codec, camera, and multi-lane recorder settings.")
         .def("start", &XimeaManager::Start, py::arg("output_path"), py::arg("output_name"), py::arg("error_cb") = nullptr,
         "Start capture loop and preview. Recording is toggled via 'r' key.")
         .def("stop", &XimeaManager::Stop,

@@ -47,27 +47,45 @@ bool XimeaCapture::Open() {
     xiSetParamFloat(camera_handle_, XI_PRM_GAIN, target_gain);
     std::cout << "Camera analog gain set to: " << target_gain << " dB (max: " << max_gain << ")" << std::endl;
 
-    // Configure GPUDirect RDMA based on xiCUDASample
-    cudaSetDevice(0);
+    // Configure GPUDirect RDMA based on xiCUDASample. GPU id must be explicit
+    // per deployment (RECORD.md "CUDA device is hard-wired to device 0").
+    cudaSetDevice(gpu_id_);
     cudaSetDeviceFlags(cudaDeviceMapHost); // Recommended in sample
 
     xiSetParamInt(camera_handle_, XI_PRM_TRANSPORT_DATA_TARGET, XI_TRANSPORT_DATA_TARGET_GPU_RAM);
     xiSetParamInt(camera_handle_, XI_PRM_IMAGE_DATA_FORMAT, XI_FRM_TRANSPORT_DATA);
     xiSetParamInt(camera_handle_, XI_PRM_OUTPUT_DATA_BIT_DEPTH, 8);
-
-    // Buffer management tuned for high-rate acquisition
     xiSetParamInt(camera_handle_, XI_PRM_BUFFER_POLICY, XI_BP_UNSAFE);
-    xiSetParamInt(camera_handle_, XI_PRM_BUFFERS_QUEUE_SIZE, 129);
 
     // Get actual payload size to set acquisition buffer size
     int payload_size = 0;
     xiGetParamInt(camera_handle_, XI_PRM_IMAGE_PAYLOAD_SIZE, &payload_size);
     if (payload_size <= 0) payload_size = width_ * height_;
 
-    // Set Acquisition Buffer Size (RDMA is limited by BAR size, often 256MB)
-    // With Above 4G Decoding/ReBAR enabled, we set this to 150 frames (approx 600MB)
-    // to provide a large safety margin against OS scheduling jitter at 1000Hz.
+    // XiAPI documents that changing XI_PRM_ACQ_BUFFER_SIZE can
+    // invalidate/recalculate XI_PRM_BUFFERS_QUEUE_SIZE, so ACQ_BUFFER_SIZE
+    // must be set FIRST (RECORD.md "XiAPI parameter ordering"). Set
+    // Acquisition Buffer Size (RDMA is limited by BAR size, often 256MB) to
+    // 150 frames (approx 600MB) as a safety margin against OS scheduling
+    // jitter at 1000Hz — With Above 4G Decoding/ReBAR enabled.
     xiSetParamInt(camera_handle_, XI_PRM_ACQ_BUFFER_SIZE, payload_size * 150);
+    xiSetParamInt(camera_handle_, XI_PRM_BUFFERS_QUEUE_SIZE, 129);
+
+    // Read back both parameters and verify the driver actually accepted
+    // them — important at 1 kHz where a silently-clamped value would starve
+    // the acquisition ring.
+    int actual_acq_buffer_size = 0;
+    int actual_queue_size = 0;
+    xiGetParamInt(camera_handle_, XI_PRM_ACQ_BUFFER_SIZE, &actual_acq_buffer_size);
+    xiGetParamInt(camera_handle_, XI_PRM_BUFFERS_QUEUE_SIZE, &actual_queue_size);
+    std::cout << "XimeaCapture: ACQ_BUFFER_SIZE requested=" << (payload_size * 150)
+              << " actual=" << actual_acq_buffer_size
+              << ", BUFFERS_QUEUE_SIZE requested=129 actual=" << actual_queue_size << std::endl;
+    if (actual_acq_buffer_size < payload_size * 150 || actual_queue_size < 100) {
+        std::cerr << "Warning: XiAPI accepted smaller buffer/queue sizes than requested; "
+                     "1 kHz acquisition safety margin is reduced."
+                  << std::endl;
+    }
 
     // Get actual dimensions
     xiGetParamInt(camera_handle_, XI_PRM_WIDTH, &width_);
@@ -128,31 +146,30 @@ void XimeaCapture::CaptureLoop() {
         std::cerr << "Warning: Failed to set thread priority to SCHED_FIFO." << std::endl;
     }
 
-    uint64_t last_expected_ts = 0;
-    uint64_t frame_interval_us = 1000000 / fps_;
+    have_last_acq_nframe_ = false;
 
     while (keep_running_) {
         XI_IMG image = {};
         image.size = sizeof(image);
         // Block up to 100ms for an image
-        XI_RETURN res = xiGetImage(camera_handle_, 100, &image); 
-        
+        XI_RETURN res = xiGetImage(camera_handle_, 100, &image);
+
         if (res == XI_OK) {
             uint64_t ts = (uint64_t)image.tsSec * 1000000ULL + (uint64_t)image.tsUSec;
-            
-            // Basic drop detection based on timestamps
-            if (last_expected_ts != 0) {
-                if (ts > last_expected_ts + frame_interval_us * 1.5) {
-                    uint64_t dropped = (ts - last_expected_ts) / frame_interval_us - 1;
-                    frames_dropped_ += dropped;
-                }
+
+            // acq_nframe is the authoritative capture sequence id (RECORD.md
+            // "Use acq_nframe as the authoritative frame sequence") — it
+            // detects camera-side loss exactly, unlike timestamp deltas.
+            if (have_last_acq_nframe_ && image.acq_nframe > last_acq_nframe_ + 1) {
+                frames_dropped_ += (image.acq_nframe - last_acq_nframe_ - 1);
             }
-            last_expected_ts = ts;
+            last_acq_nframe_ = image.acq_nframe;
+            have_last_acq_nframe_ = true;
             frames_captured_++;
 
             if (frame_callback_) {
                 // In RDMA mode, image.bp is a pointer to GPU memory
-                frame_callback_(image.bp, ts);
+                frame_callback_(image.bp, ts, image.acq_nframe);
             }
         } else if (res == XI_TIMEOUT) {
             timeouts_++;

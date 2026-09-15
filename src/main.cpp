@@ -47,15 +47,31 @@ void print_telemetry(const XimeaTelemetry& tel, bool is_recording, int idx) {
     std::lock_guard<std::mutex> lock(g_cout_mutex);
     std::string rec_status = is_recording ? "[RECORDING]" : "[IDLE]";
     std::stringstream ss;
-    ss << "\r" << std::left << std::setw(11) << rec_status << " #" << std::setw(2) << idx 
-       << " | [CAM] Cap: " << std::setw(8) << tel.cam_captured 
-       << " Drop: " << std::setw(6) << tel.cam_dropped 
+    ss << "\r" << std::left << std::setw(11) << rec_status << " #" << std::setw(2) << idx
+       << " | [CAM] Cap: " << std::setw(8) << tel.cam_captured
+       << " Drop: " << std::setw(6) << tel.cam_dropped
        << " TO: " << std::setw(4) << tel.cam_timeouts
-       << " | [REC] Enc: " << std::setw(8) << tel.rec_encoded 
-       << " Drop: " << std::setw(6) << tel.rec_dropped 
+       << " | [REC] Enc: " << std::setw(8) << tel.rec_encoded
+       << " Drop: " << std::setw(6) << tel.rec_dropped
        << " Q: " << std::setw(4) << tel.rec_queue
+       << " | [XGPU] " << std::setw(6) << tel.rec_cross_gpu_frames
+       << " [GOP] Pend: " << std::setw(3) << tel.rec_pending_gops
+       << " Gaps: " << std::setw(3) << tel.rec_gop_gaps
        << " | [DISP] " << std::setw(8) << tel.prev_displayed << "    ";
     std::cout << ss.str() << std::flush;
+}
+
+// Parses a comma-separated GPU id list, e.g. "0,0,1" -> two lanes on GPU 0,
+// one lane on GPU 1.
+std::vector<LaneConfig> parse_lane_gpus(const std::string& csv) {
+    std::vector<LaneConfig> lanes;
+    std::stringstream ss(csv);
+    std::string tok;
+    while (std::getline(ss, tok, ',')) {
+        if (tok.empty()) continue;
+        lanes.push_back({std::stoi(tok), 1.0});
+    }
+    return lanes;
 }
 
 int main(int argc, char* argv[]) {
@@ -67,6 +83,8 @@ int main(int argc, char* argv[]) {
     int display_fps = 60;
     std::string codec = "h264";
     CameraConfig cam_cfg;
+    RecorderConfig rec_cfg;
+    std::string lane_gpus_csv;
 
     app.add_option("-o,--output-path", output_path, "Output directory")->default_val(".");
     app.add_option("-n,--output-name", output_name, "Output filename prefix")->default_val("capture");
@@ -75,15 +93,31 @@ int main(int argc, char* argv[]) {
     app.add_option("-c,--codec", codec, "Codec to use (h264, h265, av1, raw)")
         ->check(CLI::IsMember({"h264", "h265", "hevc", "av1", "raw"}))
         ->default_val("h264");
-    
+
     app.add_option("--width", cam_cfg.width, "Camera width")->default_val(4096);
     app.add_option("--height", cam_cfg.height, "Camera height")->default_val(992);
     app.add_option("-e,--exposure", cam_cfg.exposure_us, "Exposure time (us)") ->default_val(900);
     app.add_option("-g,--gain", cam_cfg.gain_db, "Gain (dB), -1 for max")->default_val(-1.0f);
     app.add_option("--offset-x", cam_cfg.offset_x, "ROI X offset")->default_val(0);
     app.add_option("--offset-y", cam_cfg.offset_y, "ROI Y offset")->default_val(0);
+    app.add_option("--capture-gpu", cam_cfg.gpu_id, "GPU id that XIMEA GPUDirect frames land on")
+        ->default_val(0);
+
+    app.add_option("--lane-gpus", lane_gpus_csv,
+                    "Comma-separated GPU id per NVENC lane, e.g. '0,0,1' for two lanes on GPU 0 "
+                    "and one on GPU 1. Only used with --codec h264. Empty = auto-detect.")
+        ->default_val("");
+    app.add_option("--gop-size", rec_cfg.gop_size, "Frames per independently-decodable GOP")
+        ->default_val(30);
+    app.add_option("--lane-pool-size", rec_cfg.pool_size_per_lane,
+                    "Bounded NV12 slots preallocated per NVENC lane")
+        ->default_val(48);
 
     CLI11_PARSE(app, argc, argv);
+
+    if (!lane_gpus_csv.empty()) {
+        rec_cfg.lanes = parse_lane_gpus(lane_gpus_csv);
+    }
 
     check_system_limits();
 
@@ -93,7 +127,7 @@ int main(int argc, char* argv[]) {
         XimeaManager manager;
         
         std::cout << "Initializing XIMEA High-Speed Capture App..." << std::endl;
-        if (!manager.Initialize(save_fps, display_fps, codec, cam_cfg)) {
+        if (!manager.Initialize(save_fps, display_fps, codec, cam_cfg, rec_cfg)) {
             return 1;
         }
 

@@ -40,6 +40,10 @@ add_library(ximea_core STATIC
     src/gst_previewer.cpp
     src/ximea_manager.cpp
     src/cuda_utils.cu
+    src/encoder_lane.cpp
+    src/gop_scheduler.cpp
+    src/ordered_bitstream_serializer.cpp
+    src/multi_nv_recorder.cpp
 )
 set_target_properties(ximea_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
