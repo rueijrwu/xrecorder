@@ -20,8 +20,6 @@ EncoderLane::EncoderLane(const Config& cfg)
         cudaEventCreateWithFlags(&pool_events_[i], cudaEventDisableTiming);
         slot_in_use_[i].store(false);
     }
-    // Every encoder pipeline owns an independent non-blocking CUDA stream.
-    // This prevents legacy default-stream synchronization from coupling lanes.
     cudaStreamCreateWithFlags(&convert_stream_, cudaStreamNonBlocking);
 }
 
@@ -219,6 +217,10 @@ void EncoderLane::RequestKeyframe() {
 }
 
 void EncoderLane::PushLoop() {
+    // CUDA current-device state is thread-local. Bind this worker explicitly
+    // before touching the lane's stream/events or CUDA-backed GStreamer memory.
+    cudaSetDevice(cfg_.gpu_id);
+
     while (true) {
         PendingSubmit item;
         {
