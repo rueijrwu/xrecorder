@@ -8,13 +8,6 @@
 
 #include "time_utils.h"
 
-namespace {
-uint32_t ExpectedChunks(const OrderedBitstreamSerializer::GopBuffer& buf) {
-    if (!buf.expected_set) return 0;
-    return (buf.nominal_expected > buf.dropped) ? (buf.nominal_expected - buf.dropped) : 0;
-}
-}  // namespace
-
 OrderedBitstreamSerializer::OrderedBitstreamSerializer(const Config& cfg) : cfg_(cfg) {}
 
 OrderedBitstreamSerializer::~OrderedBitstreamSerializer() { Stop(); }
@@ -179,22 +172,29 @@ void OrderedBitstreamSerializer::EmitChunk(const EncodedChunk& chunk) {
 }
 
 void OrderedBitstreamSerializer::EmitLoop() {
+    auto expected_chunks = [](const GopBuffer& buf) -> uint32_t {
+        if (!buf.expected_set) return 0;
+        return (buf.nominal_expected > buf.dropped)
+                   ? (buf.nominal_expected - buf.dropped)
+                   : 0;
+    };
+
     while (true) {
         std::vector<EncodedChunk> to_emit;
         bool have_gop = false;
 
         {
             std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
+            cv_.wait_for(lock, std::chrono::milliseconds(100), [this, &expected_chunks] {
                 if (!keep_running_) return true;
                 auto it = pending_.find(next_expected_gop_);
                 if (it == pending_.end() || !it->second.expected_set) return false;
-                return it->second.chunks.size() >= ExpectedChunks(it->second);
+                return it->second.chunks.size() >= expected_chunks(it->second);
             });
 
             auto it = pending_.find(next_expected_gop_);
             if (it != pending_.end()) {
-                uint32_t expected = ExpectedChunks(it->second);
+                uint32_t expected = expected_chunks(it->second);
                 bool complete = it->second.expected_set && it->second.chunks.size() >= expected;
                 bool stalled = it->second.first_seen_us != 0 &&
                     now_us() - it->second.first_seen_us > cfg_.stall_timeout_ms * 1000ULL;
@@ -218,8 +218,6 @@ void OrderedBitstreamSerializer::EmitLoop() {
                        (now_us() - pending_.begin()->second.first_seen_us >
                             cfg_.stall_timeout_ms * 1000ULL ||
                         !keep_running_)) {
-                // A GOP with no registration at all indicates a pipeline logic
-                // failure; skip forward rather than block the recording forever.
                 gop_gaps_.fetch_add(1, std::memory_order_relaxed);
                 next_expected_gop_ = pending_.begin()->first;
                 continue;
