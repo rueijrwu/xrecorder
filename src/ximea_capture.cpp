@@ -14,6 +14,31 @@ XimeaCapture::~XimeaCapture() {
 }
 
 bool XimeaCapture::Open() {
+    // Match XIMEA's GPUDirect sample ordering as closely as possible:
+    // select/configure the CUDA device before xiOpenDevice().
+    cudaError_t cuda_stat = cudaSetDevice(gpu_id_);
+    if (cuda_stat != cudaSuccess) {
+        std::cerr << "cudaSetDevice(" << gpu_id_ << ") before xiOpenDevice failed: "
+                  << cudaGetErrorString(cuda_stat) << std::endl;
+        return false;
+    }
+
+    cuda_stat = cudaSetDeviceFlags(cudaDeviceMapHost);
+    if (cuda_stat != cudaSuccess && cuda_stat != cudaErrorSetOnActiveProcess) {
+        std::cerr << "cudaSetDeviceFlags(cudaDeviceMapHost) failed: "
+                  << cudaGetErrorString(cuda_stat) << std::endl;
+        return false;
+    }
+    if (cuda_stat == cudaErrorSetOnActiveProcess) {
+        // CUDA runtime may already be initialized by manager startup. This is
+        // non-fatal for RDMA, but log it because XIMEA's sample sets the flag
+        // before any context is created.
+        cudaGetLastError();
+        std::cerr << "Warning: cudaDeviceMapHost could not be set because CUDA is already active; "
+                     "continuing with the existing context."
+                  << std::endl;
+    }
+
     XI_RETURN stat = xiOpenDevice(0, &camera_handle_);
     if (stat != XI_OK) {
         std::cerr << "xiOpenDevice failed: " << stat << std::endl;
@@ -40,32 +65,26 @@ bool XimeaCapture::Open() {
     xiSetParamFloat(camera_handle_, XI_PRM_GAIN, target_gain);
     std::cout << "Camera analog gain set to: " << target_gain << " dB (max: " << max_gain << ")" << std::endl;
 
-    // Configure GPUDirect target. The selected device is rebound again
-    // immediately before xiStartAcquisition(), because recorder construction
-    // may switch the calling thread's current CUDA device in the meantime.
-    cudaSetDevice(gpu_id_);
-
-    xiSetParamInt(camera_handle_, XI_PRM_TRANSPORT_DATA_TARGET, XI_TRANSPORT_DATA_TARGET_GPU_RAM);
     xiSetParamInt(camera_handle_, XI_PRM_IMAGE_DATA_FORMAT, XI_FRM_TRANSPORT_DATA);
     xiSetParamInt(camera_handle_, XI_PRM_OUTPUT_DATA_BIT_DEPTH, 8);
+    xiSetParamInt(camera_handle_, XI_PRM_TRANSPORT_DATA_TARGET,
+                  XI_TRANSPORT_DATA_TARGET_GPU_RAM);
     xiSetParamInt(camera_handle_, XI_PRM_BUFFER_POLICY, XI_BP_UNSAFE);
 
     int payload_size = 0;
     xiGetParamInt(camera_handle_, XI_PRM_IMAGE_PAYLOAD_SIZE, &payload_size);
     if (payload_size <= 0) payload_size = width_ * height_;
 
-    // XiAPI acquisition ring is only a short capture-jitter buffer. Encoder
-    // backlog lives in the application's per-lane pools after ownership copy.
-    // At 2048x1024 this is ~130 MiB instead of the previous ~304 MiB.
-    constexpr int kAcqBufferFrames = 64;
-    // This camera reports XI_PRM_BUFFERS_QUEUE_SIZE valid range 2..63.
-    constexpr int kQueueFrames = 63;
+    // XIMEA's GPUDirect sample uses exactly four payload buffers for RDMA.
+    // Keep the diagnostic path identical and let XiAPI manage its queue size.
+    constexpr int kAcqBufferFrames = 4;
     const int requested_acq_buffer_size = payload_size * kAcqBufferFrames;
-
-    // ACQ_BUFFER_SIZE must be set before BUFFERS_QUEUE_SIZE because XiAPI can
-    // recalculate the queue when acquisition-buffer size changes.
-    xiSetParamInt(camera_handle_, XI_PRM_ACQ_BUFFER_SIZE, requested_acq_buffer_size);
-    xiSetParamInt(camera_handle_, XI_PRM_BUFFERS_QUEUE_SIZE, kQueueFrames);
+    stat = xiSetParamInt(camera_handle_, XI_PRM_ACQ_BUFFER_SIZE,
+                         requested_acq_buffer_size);
+    if (stat != XI_OK) {
+        std::cerr << "xiSetParam(ACQ_BUFFER_SIZE) failed: " << stat << std::endl;
+        return false;
+    }
 
     int actual_acq_buffer_size = 0;
     int actual_queue_size = 0;
@@ -73,13 +92,8 @@ bool XimeaCapture::Open() {
     xiGetParamInt(camera_handle_, XI_PRM_BUFFERS_QUEUE_SIZE, &actual_queue_size);
     std::cout << "XimeaCapture: ACQ_BUFFER_SIZE requested=" << requested_acq_buffer_size
               << " actual=" << actual_acq_buffer_size
-              << ", BUFFERS_QUEUE_SIZE requested=" << kQueueFrames
-              << " actual=" << actual_queue_size << std::endl;
-    if (actual_acq_buffer_size < requested_acq_buffer_size || actual_queue_size < kQueueFrames) {
-        std::cerr << "Warning: XiAPI accepted smaller buffer/queue sizes than requested; "
-                     "capture jitter margin is reduced."
-                  << std::endl;
-    }
+              << ", BUFFERS_QUEUE_SIZE left at XiAPI default actual=" << actual_queue_size
+              << std::endl;
 
     xiGetParamInt(camera_handle_, XI_PRM_WIDTH, &width_);
     xiGetParamInt(camera_handle_, XI_PRM_HEIGHT, &height_);
@@ -107,10 +121,8 @@ bool XimeaCapture::StartAcquisition(FrameCallback callback, ErrorCallback error_
     frames_dropped_ = 0;
     timeouts_ = 0;
 
-    // CRITICAL for XiAPI GPUDirect: CUDA current-device state is thread-local
-    // and MultiNvRecorder construction touches both GPUs. XIMEA requires the
-    // GPUDirect target device to be current at xiStartAcquisition(), not merely
-    // when camera parameters were configured in Open().
+    // Rebind the selected GPUDirect GPU immediately before acquisition in case
+    // recorder construction touched the other CUDA device.
     cudaError_t cuda_stat = cudaSetDevice(gpu_id_);
     if (cuda_stat != cudaSuccess) {
         std::cerr << "cudaSetDevice(" << gpu_id_ << ") before xiStartAcquisition failed: "
