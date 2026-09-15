@@ -70,8 +70,6 @@ void MultiNvRecorder::SetupLaneTransfer(int lane_id, int lane_gpu_id) {
     const bool local = (lane_gpu_id == cfg_.capture_gpu_id);
     transfer.peer_ok = local;
 
-    // The copy stream is owned by the destination lane GPU. For a remote
-    // lane, direct P2P therefore requires destination->capture peer access.
     if (!local) {
         int can_access = 0;
         cudaDeviceCanAccessPeer(&can_access, lane_gpu_id, cfg_.capture_gpu_id);
@@ -95,9 +93,6 @@ void MultiNvRecorder::SetupLaneTransfer(int lane_id, int lane_gpu_id) {
     }
 
     if (!local && !transfer.peer_ok) {
-        // Fallback stays fully lane-local: each remote lane owns its own
-        // capture-side D2H stream, pinned ring, events, and destination H2D
-        // copy stream. The two 5070 pipelines never share a transfer stream.
         transfer.pinned_staging.assign(cfg_.pool_size_per_lane, nullptr);
         transfer.d2h_done_events.assign(cfg_.pool_size_per_lane, nullptr);
 
@@ -136,24 +131,25 @@ void MultiNvRecorder::BuildSerializer() {
 }
 
 void MultiNvRecorder::RegisterMissingFrames(uint64_t first_source_index, uint64_t count) {
-    // Split camera-side sequence gaps by GOP. Work is bounded by the number
-    // of GOPs crossed rather than by every missing frame individually.
-    const uint64_t gop_size = static_cast<uint64_t>(cfg_.gop_size);
+    // Logical FrameGroup boundaries are still the encoder GOP boundaries.
+    // Split camera-side sequence gaps by those boundaries so missing frames
+    // never collapse the source timeline.
+    const uint64_t group_size = static_cast<uint64_t>(cfg_.gop_size);
     uint64_t source = first_source_index;
     uint64_t remaining = count;
 
     while (remaining > 0) {
-        uint64_t gop_index = source / gop_size;
-        uint64_t offset = source % gop_size;
-        uint32_t in_this_gop = static_cast<uint32_t>(
-            std::min<uint64_t>(remaining, gop_size - offset));
+        const uint64_t group_index = source / group_size;
+        const uint64_t offset = source % group_size;
+        const uint32_t in_this_group = static_cast<uint32_t>(
+            std::min<uint64_t>(remaining, group_size - offset));
 
-        serializer_->SetGopExpectedCount(gop_index,
+        serializer_->SetGopExpectedCount(group_index,
                                          static_cast<uint32_t>(cfg_.gop_size));
-        serializer_->NotifyFramesDropped(gop_index, in_this_gop);
+        serializer_->NotifyFramesDropped(group_index, in_this_group);
 
-        source += in_this_gop;
-        remaining -= in_this_gop;
+        source += in_this_group;
+        remaining -= in_this_group;
     }
 }
 
@@ -169,7 +165,7 @@ bool MultiNvRecorder::Start(ErrorCallback error_cb) {
     frames_submitted_ = 0;
     frames_dropped_ = 0;
     cross_gpu_frames_ = 0;
-    gop_routes_.clear();
+    frame_group_routes_.clear();
 
     BuildSerializer();
     if (!serializer_->Start(error_callback_)) return false;
@@ -201,7 +197,7 @@ void MultiNvRecorder::Stop() {
     for (auto& lane : lanes_) lane->Stop();
     if (serializer_) serializer_->Stop();
 
-    gop_routes_.clear();
+    frame_group_routes_.clear();
     started_.store(false, std::memory_order_relaxed);
 }
 
@@ -216,10 +212,8 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
         last_source_index_ = 0;
         source_index = 0;
     } else {
-        // uint32 subtraction naturally handles acq_nframe wrap.
         uint32_t step = acq_nframe - last_acq_nframe_;
 
-        // Duplicate or unexpected backwards/reset sequence.
         if (step == 0 || step > 0x80000000u) {
             frames_dropped_.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -235,24 +229,30 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
         last_acq_nframe_ = acq_nframe;
     }
 
-    const uint64_t gop_index =
+    // FrameGroup is a logical routing interval only. We do NOT wait for all
+    // frames in the group. Every frame streams immediately after its ownership
+    // copy into the one lane selected for this interval.
+    const uint64_t group_index =
         source_index / static_cast<uint64_t>(cfg_.gop_size);
 
-    // Assign a GOP when its first actual frame arrives. If its nominal first
-    // camera frame was missing, this actual frame still must become the IDR.
-    auto route_it = gop_routes_.find(gop_index);
-    if (route_it == gop_routes_.end()) {
-        int lane_idx = scheduler_->AssignLane(
+    auto route_it = frame_group_routes_.find(group_index);
+    if (route_it == frame_group_routes_.end()) {
+        const int lane_idx = scheduler_->AssignLane(
             [this](int id) { return lanes_[static_cast<size_t>(id)]->QueueDepth(); },
             cfg_.max_queue_depth);
-        route_it = gop_routes_.emplace(gop_index, GopRoute{lane_idx, true}).first;
-        serializer_->SetGopExpectedCount(gop_index,
+        route_it = frame_group_routes_
+                       .emplace(group_index, FrameGroupRoute{lane_idx, true})
+                       .first;
+
+        // The logical FrameGroup and encoded H.264 GOP use the same index and
+        // nominal frame count, which lets the serializer restore group order.
+        serializer_->SetGopExpectedCount(group_index,
                                          static_cast<uint32_t>(cfg_.gop_size));
 
-        if (gop_index >= 8) gop_routes_.erase(gop_index - 8);
+        if (group_index >= 8) frame_group_routes_.erase(group_index - 8);
     }
 
-    GopRoute& route = route_it->second;
+    FrameGroupRoute& route = route_it->second;
     EncoderLane* lane = lanes_[static_cast<size_t>(route.lane_idx)].get();
     LaneTransfer& transfer = lane_transfers_.at(route.lane_idx);
 
@@ -260,8 +260,7 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
     void* nv12_dst = lane->ReserveSlot(&slot_index);
     if (!nv12_dst) {
         frames_dropped_.fetch_add(1, std::memory_order_relaxed);
-        serializer_->NotifyFramesDropped(gop_index, 1);
-        // Keep needs_idr=true if no frame from this GOP has been submitted.
+        serializer_->NotifyFramesDropped(group_index, 1);
         return;
     }
 
@@ -273,8 +272,6 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
     cudaError_t copy_submit = cudaSuccess;
 
     if (local) {
-        // Even the local PRO lane performs one ownership copy. The process
-        // pipeline never reads directly from XiAPI-managed RDMA memory.
         cudaSetDevice(cfg_.capture_gpu_id);
         copy_submit = cudaMemcpyAsync(gray8_dst, xi_gpu_ptr, gray8_size_,
                                       cudaMemcpyDeviceToDevice,
@@ -294,8 +291,6 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
     } else {
         cross_gpu_frames_.fetch_add(1, std::memory_order_relaxed);
 
-        // Fallback ownership copy: PRO VRAM -> pinned host -> 5070 VRAM.
-        // Capture still synchronizes only the final copy_done event.
         cudaSetDevice(cfg_.capture_gpu_id);
         copy_submit = cudaMemcpyAsync(
             transfer.pinned_staging[static_cast<size_t>(slot_index)],
@@ -328,7 +323,7 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
     if (copy_submit != cudaSuccess) {
         lane->CancelReservedSlot(slot_index);
         frames_dropped_.fetch_add(1, std::memory_order_relaxed);
-        serializer_->NotifyFramesDropped(gop_index, 1);
+        serializer_->NotifyFramesDropped(group_index, 1);
         if (error_callback_) {
             error_callback_(std::string("Ownership copy submission failed: ") +
                             cudaGetErrorString(copy_submit));
@@ -336,14 +331,14 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
         return;
     }
 
-    // This is the ONLY capture-side synchronization point. Once copy_done
-    // fires, XiAPI's RDMA source is no longer needed by the recorder.
+    // The only capture-side synchronization. We never wait for completion of
+    // the rest of the logical FrameGroup, conversion, or NVENC.
     cudaSetDevice(lane->gpu_id());
     cudaError_t copy_status = cudaEventSynchronize(copy_done);
     if (copy_status != cudaSuccess) {
         lane->CancelReservedSlot(slot_index);
         frames_dropped_.fetch_add(1, std::memory_order_relaxed);
-        serializer_->NotifyFramesDropped(gop_index, 1);
+        serializer_->NotifyFramesDropped(group_index, 1);
         if (error_callback_) {
             error_callback_(std::string("Ownership copy failed: ") +
                             cudaGetErrorString(copy_status));
@@ -351,19 +346,16 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
         return;
     }
 
-    // Ownership has transferred. From here on, capture is independent of
-    // conversion and NVENC. Enqueue the selected lane's process work on its
-    // own non-blocking stream and return immediately.
     convert_gray8_to_nv12_gpu(static_cast<const uint8_t*>(gray8_dst),
                                static_cast<uint8_t*>(nv12_dst),
                                cfg_.width, cfg_.height,
                                lane->ConvertStream());
 
     if (first_ts_us_ == 0) first_ts_us_ = timestamp_us;
-    uint64_t pts_ns = (timestamp_us - first_ts_us_) * 1000ULL;
+    const uint64_t pts_ns = (timestamp_us - first_ts_us_) * 1000ULL;
 
     const bool force_idr = route.needs_idr;
-    lane->SubmitSlot(slot_index, gop_index, source_index, pts_ns, force_idr);
+    lane->SubmitSlot(slot_index, group_index, source_index, pts_ns, force_idr);
     route.needs_idr = false;
     frames_submitted_.fetch_add(1, std::memory_order_relaxed);
 }
