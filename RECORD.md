@@ -709,3 +709,152 @@ serializer restores strict source order
 ```
 
 That is the architecture most likely to achieve reliable 1 kHz recording with the RTX 5070 Ti + RTX PRO 2000 Blackwell configuration while preserving reasonable H.264 compression efficiency.
+
+---
+
+# Implementation status
+
+## Completed (Steps 1–12)
+
+**Step 1: Explicit CUDA/GPU ID support**
+- `XimeaCapture::SetGpuId()` / `GetGpuId()` (default 0)
+- `EncoderLane::Config::gpu_id` per lane
+- `MultiNvRecorder::Config::capture_gpu_id` (the GPU that GPUDirect frames land on)
+- CLI: `--capture-gpu N`, `--lane-gpus CSV` (e.g., `--lane-gpus 0,0,1`)
+
+**Step 2: acq_nframe as authoritative sequence**
+- Threaded from `XI_IMG::acq_nframe` through capture callback signature
+- Drop detection now uses frame count, not timestamp deltas
+- Passed to `MultiNvRecorder::PushFrame()` for precise GOP boundaries and loss accounting
+
+**Step 3: XiAPI parameter ordering and verification**
+- `XI_PRM_ACQ_BUFFER_SIZE` set **before** `XI_PRM_BUFFERS_QUEUE_SIZE` (RECORD.md order)
+- Both parameters read back after setting; warning if driver clamps values below request
+- Important at 1 kHz where silent clamp would starve the acquisition ring
+
+**Step 4: Bounded per-lane pools**
+- Replaced 1000-slot 10 GB pool with 48-slot per-lane (default, configurable via `--lane-pool-size`)
+- Per-lane pool at 4096×992: ~390 MB NV12 (vs. 10 GB for 1000-slot design)
+
+**Step 5: Remove local GRAY8 copy**
+- Lanes on capture GPU: convert GRAY8 → NV12 directly from XIMEA GPUDirect pointer
+- No intermediate GRAY8 copy, saves 4 MB/frame for local lanes
+
+**Step 6–7: EncoderLane + multi-GPU instantiation**
+- `EncoderLane` class: one NVENC session per GPU, explicit `cuda-device-id=N`
+- Three lanes by default: two on 5070 Ti (NVENC engines A & B), one on PRO 2000
+- Auto-detection of available GPUs; override via `--lane-gpus`
+
+**Step 8: Cross-GPU GRAY8 transfer**
+- P2P `cudaMemcpyPeerAsync` (preferred) with automatic fallback to pinned-host staging
+- Transfer happens on the capture GPU's stream; convert happens on destination GPU's stream
+- See "Cross-GPU Transfer Design" section below
+
+**Step 9–10: GOP scheduling and appsink**
+- `GopScheduler`: weighted round-robin, skips overloaded lanes
+- Each lane's pipeline ends in `appsink` (no mux/filesink per lane)
+
+**Step 11: OrderedBitstreamSerializer**
+- Buffers encoded chunks from all lanes keyed by GOP index
+- Emits GOPs strictly in source order into final pipeline: `h264parse ! matroskamux ! filesink`
+- Force-flushes incomplete/stalled GOPs (2 s timeout) rather than blocking forever
+- Counts frame/GOP gaps in telemetry
+
+**Step 12: Telemetry and metadata**
+- Per-lane stats: submitted, completed, dropped, queue depth, encode latency percentiles (p95/p99/p999)
+- Cross-GPU frame counter, pending/gap GOP counts, bytes written
+- `XimeaTelemetry` extended; pybind11 bindings updated
+- CLI telemetry line includes GOP gaps and cross-GPU frame count
+
+## Deferred (Steps 13–14)
+
+**Step 13: Per-lane benchmarking**
+- Requires hardware test run
+- Once measured, update `RecorderConfig::lanes[i].weight` with actual sustained fps
+- Current default: equal weights (1.0) for all lanes
+
+**Step 14: 1 kHz stress test**
+- Long-duration test to validate zero frame/GOP gaps and bounded queue depth
+- Measure p99/p999 latencies, identify jitter sources
+- Tune pool sizes, stall timeout, and scheduling thresholds
+
+---
+
+# Cross-GPU Transfer Design
+
+## Why cross-GPU transfer is necessary
+
+The XIMEA GPUDirect RDMA can only stream to **one GPU at a time**. Three design choices:
+
+1. **Capture to GPU with most NVENC capacity** (current)
+   - 5070 Ti receives all frames (4.063 GB/s at 1000 fps, 4096×992)
+   - 2/3 encoding local (5070 Ti lanes) — no transfer
+   - 1/3 frames cross to PRO 2000 — **~1.35 GB/s** (acceptable)
+
+2. **Capture to PRO 2000, transfer back**
+   - 2/3 of frames must cross to 5070 Ti — **~2.7 GB/s** (worse)
+
+3. **Use only one GPU**
+   - Wastes an NVENC engine, cannot sustain 1000 fps
+
+Option 1 minimizes cross-GPU bandwidth. RECORD.md "GPU placement" section justifies this trade-off.
+
+## Current implementation: 48-slot staging pool
+
+For each remote GPU (e.g., PRO 2000), the code allocates:
+
+```cpp
+rt.gray8_staging.assign(cfg_.pool_size_per_lane, nullptr);  // 48 slots on PRO 2000
+```
+
+**Why 48 slots:**
+- Matches the bounded pool of the destination lane
+- Allows transfer to be fully **pipelined** with encoding: while one frame is converting/encoding, the next transfer can be in-flight
+- With 1 ms per frame and ~3 ms encode latency, a lane can have ~3 frames in-flight; 48 slots provide ample safety margin
+- P2P and pinned-host transfers are asynchronous; pipelining hides transfer latency
+
+**Trade-off:**
+- GPU memory: 48 × 4 MB ≈ 192 MB on each remote GPU
+- For PRO 2000 with 24 GB VRAM, this is negligible
+- For lower-VRAM GPUs, could reduce to a 2–4 slot ring buffer with synchronous transfer (but loses parallelism)
+
+## Alternative: 2-slot ring buffer
+
+A lighter approach for memory-constrained deployments:
+
+```cpp
+// Allocate just 2 staging buffers instead of 48
+rt.gray8_staging.assign(2, nullptr);
+```
+
+**Pros:**
+- Saves ~188 MB per remote GPU
+- Still allows some pipelining (transfer N while encoding N-1)
+
+**Cons:**
+- More complex synchronization (must wait for previous transfer to complete before reusing slot)
+- Slightly higher per-frame latency (serialized dependency)
+- Not recommended unless VRAM is truly constrained
+
+For the current RTX 5070 Ti + PRO 2000 setup, **48-slot is fine**. If deploying to lower-VRAM devices, measure the impact and tune accordingly.
+
+---
+
+# Known limitations and future work
+
+1. **Lane weight tuning requires benchmarking** (step 13)
+   - Current weights are equal; scheduler distributes GOPs uniformly
+   - Real GPUs may have different sustained fps; once measured, update weights for better load balance
+
+2. **Capture thread allocations**
+   - `gop_lane_map_` uses `std::map::insert` ~33 Hz (one per GOP)
+   - RECORD.md capture-thread rule discourages steady-state allocations
+   - Low frequency makes this unlikely to cause jitter, but a fixed-size ring array would close the gap
+
+3. **Cross-GPU transfer latency not in telemetry**
+   - Only a frame counter (`rec_cross_gpu_frames`), not percentile latency
+   - Adding event-based timing would require capture-thread changes (careful to avoid stalls)
+
+4. **No automatic lane redistribution**
+   - If one lane dies, GOP scheduler skips to the least-loaded live lane, but does not rebalance weights
+   - Manual reconfiguration or dynamic weight adjustment could help, but would complicate restart logic
