@@ -13,6 +13,7 @@ MultiNvRecorder::MultiNvRecorder(const Config& cfg, const std::string& output_pa
     std::vector<GopScheduler::LaneWeight> weights;
     for (size_t i = 0; i < cfg_.lanes.size(); ++i) {
         const auto& spec = cfg_.lanes[i];
+
         EncoderLane::Config lane_cfg;
         lane_cfg.lane_id = static_cast<int>(i);
         lane_cfg.gpu_id = spec.gpu_id;
@@ -25,81 +26,102 @@ MultiNvRecorder::MultiNvRecorder(const Config& cfg, const std::string& output_pa
         lanes_.push_back(std::make_unique<EncoderLane>(lane_cfg));
         weights.push_back({static_cast<int>(i), spec.weight});
 
-        if (spec.gpu_id != cfg_.capture_gpu_id) {
-            // Transfer ownership and fallback transfer stream are per encoder
-            // lane. Two 5070 lanes therefore remain independent even though
-            // they share the same physical destination GPU.
-            SetupRemoteTransfer(static_cast<int>(i), spec.gpu_id);
-        }
+        // Every lane gets an application-owned GRAY8 ring and an independent
+        // copy stream, including the local PRO lane. This establishes one
+        // identical ownership boundary for all three pipelines.
+        SetupLaneTransfer(static_cast<int>(i), spec.gpu_id);
     }
+
     scheduler_ = std::make_unique<GopScheduler>(weights);
 }
 
 MultiNvRecorder::~MultiNvRecorder() {
     Stop();
-    for (auto& [lane_id, rt] : remote_transfers_) {
+
+    for (auto& [lane_id, transfer] : lane_transfers_) {
         (void)lane_id;
 
-        cudaSetDevice(rt.gpu_id);
-        for (void* p : rt.gray8_staging) {
+        cudaSetDevice(transfer.gpu_id);
+        for (void* p : transfer.gray8_staging) {
             if (p) cudaFree(p);
         }
+        for (cudaEvent_t e : transfer.copy_done_events) {
+            if (e) cudaEventDestroy(e);
+        }
+        if (transfer.copy_stream) cudaStreamDestroy(transfer.copy_stream);
 
-        if (!rt.peer_ok) {
+        if (!transfer.peer_ok && transfer.gpu_id != cfg_.capture_gpu_id) {
             cudaSetDevice(cfg_.capture_gpu_id);
-            for (cudaEvent_t e : rt.xfer_events) {
+            for (cudaEvent_t e : transfer.d2h_done_events) {
                 if (e) cudaEventDestroy(e);
             }
-            if (rt.capture_stream) cudaStreamDestroy(rt.capture_stream);
-            for (void* p : rt.pinned_staging) {
+            if (transfer.capture_stream) cudaStreamDestroy(transfer.capture_stream);
+            for (void* p : transfer.pinned_staging) {
                 if (p) cudaFreeHost(p);
             }
         }
     }
 }
 
-void MultiNvRecorder::SetupRemoteTransfer(int lane_id, int lane_gpu_id) {
-    RemoteTransfer rt;
-    rt.gpu_id = lane_gpu_id;
+void MultiNvRecorder::SetupLaneTransfer(int lane_id, int lane_gpu_id) {
+    LaneTransfer transfer;
+    transfer.gpu_id = lane_gpu_id;
 
-    // P2P work is issued on this destination lane's ConvertStream(), so the
-    // destination GPU needs peer access to the capture GPU.
-    int can_access = 0;
-    cudaDeviceCanAccessPeer(&can_access, lane_gpu_id, cfg_.capture_gpu_id);
-    if (can_access) {
-        cudaSetDevice(lane_gpu_id);
-        cudaError_t err = cudaDeviceEnablePeerAccess(cfg_.capture_gpu_id, 0);
-        rt.peer_ok = (err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled);
-        if (err == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
-    }
+    const bool local = (lane_gpu_id == cfg_.capture_gpu_id);
+    transfer.peer_ok = local;
 
-    std::cout << "MultiNvRecorder: lane " << lane_id
-              << " cross-GPU path capture_gpu=" << cfg_.capture_gpu_id
-              << " -> lane_gpu=" << lane_gpu_id
-              << (rt.peer_ok ? " uses P2P" : " uses pinned-host staging fallback") << std::endl;
-
-    rt.gray8_staging.assign(cfg_.pool_size_per_lane, nullptr);
-    cudaSetDevice(lane_gpu_id);
-    for (int i = 0; i < cfg_.pool_size_per_lane; ++i) {
-        cudaMalloc(&rt.gray8_staging[i], gray8_size_);
-    }
-
-    if (!rt.peer_ok) {
-        rt.pinned_staging.assign(cfg_.pool_size_per_lane, nullptr);
-        rt.xfer_events.assign(cfg_.pool_size_per_lane, nullptr);
-
-        cudaSetDevice(cfg_.capture_gpu_id);
-        // Every remote encoder pipeline gets its own capture-side transfer
-        // stream. This avoids serializing both 5070 lanes through one D2H
-        // stream when P2P is unavailable.
-        cudaStreamCreateWithFlags(&rt.capture_stream, cudaStreamNonBlocking);
-        for (int i = 0; i < cfg_.pool_size_per_lane; ++i) {
-            cudaHostAlloc(&rt.pinned_staging[i], gray8_size_, cudaHostAllocDefault);
-            cudaEventCreateWithFlags(&rt.xfer_events[i], cudaEventDisableTiming);
+    // The copy stream is owned by the destination lane GPU. For a remote
+    // lane, direct P2P therefore requires destination->capture peer access.
+    if (!local) {
+        int can_access = 0;
+        cudaDeviceCanAccessPeer(&can_access, lane_gpu_id, cfg_.capture_gpu_id);
+        if (can_access) {
+            cudaSetDevice(lane_gpu_id);
+            cudaError_t err = cudaDeviceEnablePeerAccess(cfg_.capture_gpu_id, 0);
+            transfer.peer_ok =
+                (err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled);
+            if (err == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
         }
     }
 
-    remote_transfers_.emplace(lane_id, std::move(rt));
+    cudaSetDevice(lane_gpu_id);
+    cudaStreamCreateWithFlags(&transfer.copy_stream, cudaStreamNonBlocking);
+
+    transfer.gray8_staging.assign(cfg_.pool_size_per_lane, nullptr);
+    transfer.copy_done_events.assign(cfg_.pool_size_per_lane, nullptr);
+    for (int i = 0; i < cfg_.pool_size_per_lane; ++i) {
+        cudaMalloc(&transfer.gray8_staging[i], gray8_size_);
+        cudaEventCreateWithFlags(&transfer.copy_done_events[i], cudaEventDisableTiming);
+    }
+
+    if (!local && !transfer.peer_ok) {
+        // Fallback stays fully lane-local: each remote lane owns its own
+        // capture-side D2H stream, pinned ring, events, and destination H2D
+        // copy stream. The two 5070 pipelines never share a transfer stream.
+        transfer.pinned_staging.assign(cfg_.pool_size_per_lane, nullptr);
+        transfer.d2h_done_events.assign(cfg_.pool_size_per_lane, nullptr);
+
+        cudaSetDevice(cfg_.capture_gpu_id);
+        cudaStreamCreateWithFlags(&transfer.capture_stream, cudaStreamNonBlocking);
+        for (int i = 0; i < cfg_.pool_size_per_lane; ++i) {
+            cudaHostAlloc(&transfer.pinned_staging[i], gray8_size_, cudaHostAllocDefault);
+            cudaEventCreateWithFlags(&transfer.d2h_done_events[i], cudaEventDisableTiming);
+        }
+    }
+
+    std::cout << "MultiNvRecorder: lane " << lane_id
+              << " copy path capture_gpu=" << cfg_.capture_gpu_id
+              << " -> lane_gpu=" << lane_gpu_id;
+    if (local) {
+        std::cout << " uses local D2D ownership copy";
+    } else if (transfer.peer_ok) {
+        std::cout << " uses direct P2P ownership copy";
+    } else {
+        std::cout << " uses pinned-host ownership copy fallback";
+    }
+    std::cout << std::endl;
+
+    lane_transfers_.emplace(lane_id, std::move(transfer));
 }
 
 void MultiNvRecorder::BuildSerializer() {
@@ -114,9 +136,8 @@ void MultiNvRecorder::BuildSerializer() {
 }
 
 void MultiNvRecorder::RegisterMissingFrames(uint64_t first_source_index, uint64_t count) {
-    // Split a camera-side sequence gap by GOP instead of iterating once per
-    // missing frame. This keeps capture-thread work bounded by the number of
-    // GOPs crossed by the gap.
+    // Split camera-side sequence gaps by GOP. Work is bounded by the number
+    // of GOPs crossed rather than by every missing frame individually.
     const uint64_t gop_size = static_cast<uint64_t>(cfg_.gop_size);
     uint64_t source = first_source_index;
     uint64_t remaining = count;
@@ -127,7 +148,8 @@ void MultiNvRecorder::RegisterMissingFrames(uint64_t first_source_index, uint64_
         uint32_t in_this_gop = static_cast<uint32_t>(
             std::min<uint64_t>(remaining, gop_size - offset));
 
-        serializer_->SetGopExpectedCount(gop_index, static_cast<uint32_t>(cfg_.gop_size));
+        serializer_->SetGopExpectedCount(gop_index,
+                                         static_cast<uint32_t>(cfg_.gop_size));
         serializer_->NotifyFramesDropped(gop_index, in_this_gop);
 
         source += in_this_gop;
@@ -141,7 +163,6 @@ bool MultiNvRecorder::Start(ErrorCallback error_cb) {
 
     error_callback_ = std::move(error_cb);
     have_acq_sequence_ = false;
-    first_acq_nframe_ = 0;
     last_acq_nframe_ = 0;
     last_source_index_ = 0;
     first_ts_us_ = 0;
@@ -158,7 +179,8 @@ bool MultiNvRecorder::Start(ErrorCallback error_cb) {
             [this](EncodedChunk&& chunk) { serializer_->PushChunk(std::move(chunk)); },
             error_callback_);
         if (!ok) {
-            std::cerr << "MultiNvRecorder: failed to start lane " << lane->lane_id() << std::endl;
+            std::cerr << "MultiNvRecorder: failed to start lane " << lane->lane_id()
+                      << std::endl;
             for (auto& started_lane : lanes_) {
                 if (started_lane.get() == lane.get()) break;
                 started_lane->Stop();
@@ -183,22 +205,21 @@ void MultiNvRecorder::Stop() {
     started_.store(false, std::memory_order_relaxed);
 }
 
-void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us, uint32_t acq_nframe) {
+void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
+                                uint32_t acq_nframe) {
     if (!started_.load(std::memory_order_relaxed)) return;
 
     uint64_t source_index = 0;
     if (!have_acq_sequence_) {
         have_acq_sequence_ = true;
-        first_acq_nframe_ = acq_nframe;
         last_acq_nframe_ = acq_nframe;
         last_source_index_ = 0;
         source_index = 0;
     } else {
-        // Unsigned subtraction naturally handles the uint32 acq_nframe wrap.
+        // uint32 subtraction naturally handles acq_nframe wrap.
         uint32_t step = acq_nframe - last_acq_nframe_;
 
-        // step==0 is a duplicate. A delta > 2^31 is treated as an unexpected
-        // backwards/reset sequence rather than a multi-billion-frame gap.
+        // Duplicate or unexpected backwards/reset sequence.
         if (step == 0 || step > 0x80000000u) {
             frames_dropped_.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -214,76 +235,134 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us, uint32_
         last_acq_nframe_ = acq_nframe;
     }
 
-    uint64_t gop_index = source_index / static_cast<uint64_t>(cfg_.gop_size);
+    const uint64_t gop_index =
+        source_index / static_cast<uint64_t>(cfg_.gop_size);
 
-    // Assign the GOP when its first ACTUAL frame arrives. If the nominal GOP
-    // boundary frame was missing, this first actual frame must still become
-    // the IDR for that independently encoded GOP.
+    // Assign a GOP when its first actual frame arrives. If its nominal first
+    // camera frame was missing, this actual frame still must become the IDR.
     auto route_it = gop_routes_.find(gop_index);
     if (route_it == gop_routes_.end()) {
         int lane_idx = scheduler_->AssignLane(
             [this](int id) { return lanes_[static_cast<size_t>(id)]->QueueDepth(); },
             cfg_.max_queue_depth);
         route_it = gop_routes_.emplace(gop_index, GopRoute{lane_idx, true}).first;
-        serializer_->SetGopExpectedCount(gop_index, static_cast<uint32_t>(cfg_.gop_size));
+        serializer_->SetGopExpectedCount(gop_index,
+                                         static_cast<uint32_t>(cfg_.gop_size));
 
         if (gop_index >= 8) gop_routes_.erase(gop_index - 8);
     }
 
     GopRoute& route = route_it->second;
     EncoderLane* lane = lanes_[static_cast<size_t>(route.lane_idx)].get();
+    LaneTransfer& transfer = lane_transfers_.at(route.lane_idx);
 
     int slot_index = -1;
     void* nv12_dst = lane->ReserveSlot(&slot_index);
     if (!nv12_dst) {
         frames_dropped_.fetch_add(1, std::memory_order_relaxed);
         serializer_->NotifyFramesDropped(gop_index, 1);
-        // Keep needs_idr=true if this was the first actual frame of the GOP.
+        // Keep needs_idr=true if no frame from this GOP has been submitted.
         return;
     }
+
+    void* gray8_dst = transfer.gray8_staging[static_cast<size_t>(slot_index)];
+    cudaEvent_t copy_done =
+        transfer.copy_done_events[static_cast<size_t>(slot_index)];
+
+    const bool local = (lane->gpu_id() == cfg_.capture_gpu_id);
+    cudaError_t copy_submit = cudaSuccess;
+
+    if (local) {
+        // Even the local PRO lane performs one ownership copy. The process
+        // pipeline never reads directly from XiAPI-managed RDMA memory.
+        cudaSetDevice(cfg_.capture_gpu_id);
+        copy_submit = cudaMemcpyAsync(gray8_dst, xi_gpu_ptr, gray8_size_,
+                                      cudaMemcpyDeviceToDevice,
+                                      transfer.copy_stream);
+        if (copy_submit == cudaSuccess) {
+            copy_submit = cudaEventRecord(copy_done, transfer.copy_stream);
+        }
+    } else if (transfer.peer_ok) {
+        cross_gpu_frames_.fetch_add(1, std::memory_order_relaxed);
+        cudaSetDevice(lane->gpu_id());
+        copy_submit = cudaMemcpyPeerAsync(gray8_dst, lane->gpu_id(),
+                                          xi_gpu_ptr, cfg_.capture_gpu_id,
+                                          gray8_size_, transfer.copy_stream);
+        if (copy_submit == cudaSuccess) {
+            copy_submit = cudaEventRecord(copy_done, transfer.copy_stream);
+        }
+    } else {
+        cross_gpu_frames_.fetch_add(1, std::memory_order_relaxed);
+
+        // Fallback ownership copy: PRO VRAM -> pinned host -> 5070 VRAM.
+        // Capture still synchronizes only the final copy_done event.
+        cudaSetDevice(cfg_.capture_gpu_id);
+        copy_submit = cudaMemcpyAsync(
+            transfer.pinned_staging[static_cast<size_t>(slot_index)],
+            xi_gpu_ptr, gray8_size_, cudaMemcpyDeviceToHost,
+            transfer.capture_stream);
+        if (copy_submit == cudaSuccess) {
+            copy_submit = cudaEventRecord(
+                transfer.d2h_done_events[static_cast<size_t>(slot_index)],
+                transfer.capture_stream);
+        }
+
+        if (copy_submit == cudaSuccess) {
+            cudaSetDevice(lane->gpu_id());
+            copy_submit = cudaStreamWaitEvent(
+                transfer.copy_stream,
+                transfer.d2h_done_events[static_cast<size_t>(slot_index)], 0);
+        }
+        if (copy_submit == cudaSuccess) {
+            copy_submit = cudaMemcpyAsync(
+                gray8_dst,
+                transfer.pinned_staging[static_cast<size_t>(slot_index)],
+                gray8_size_, cudaMemcpyHostToDevice,
+                transfer.copy_stream);
+        }
+        if (copy_submit == cudaSuccess) {
+            copy_submit = cudaEventRecord(copy_done, transfer.copy_stream);
+        }
+    }
+
+    if (copy_submit != cudaSuccess) {
+        lane->CancelReservedSlot(slot_index);
+        frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+        serializer_->NotifyFramesDropped(gop_index, 1);
+        if (error_callback_) {
+            error_callback_(std::string("Ownership copy submission failed: ") +
+                            cudaGetErrorString(copy_submit));
+        }
+        return;
+    }
+
+    // This is the ONLY capture-side synchronization point. Once copy_done
+    // fires, XiAPI's RDMA source is no longer needed by the recorder.
+    cudaSetDevice(lane->gpu_id());
+    cudaError_t copy_status = cudaEventSynchronize(copy_done);
+    if (copy_status != cudaSuccess) {
+        lane->CancelReservedSlot(slot_index);
+        frames_dropped_.fetch_add(1, std::memory_order_relaxed);
+        serializer_->NotifyFramesDropped(gop_index, 1);
+        if (error_callback_) {
+            error_callback_(std::string("Ownership copy failed: ") +
+                            cudaGetErrorString(copy_status));
+        }
+        return;
+    }
+
+    // Ownership has transferred. From here on, capture is independent of
+    // conversion and NVENC. Enqueue the selected lane's process work on its
+    // own non-blocking stream and return immediately.
+    convert_gray8_to_nv12_gpu(static_cast<const uint8_t*>(gray8_dst),
+                               static_cast<uint8_t*>(nv12_dst),
+                               cfg_.width, cfg_.height,
+                               lane->ConvertStream());
 
     if (first_ts_us_ == 0) first_ts_us_ = timestamp_us;
     uint64_t pts_ns = (timestamp_us - first_ts_us_) * 1000ULL;
 
-    if (lane->gpu_id() == cfg_.capture_gpu_id) {
-        cudaSetDevice(lane->gpu_id());
-        convert_gray8_to_nv12_gpu(static_cast<const uint8_t*>(xi_gpu_ptr),
-                                   static_cast<uint8_t*>(nv12_dst), cfg_.width, cfg_.height,
-                                   lane->ConvertStream());
-    } else {
-        cross_gpu_frames_.fetch_add(1, std::memory_order_relaxed);
-        RemoteTransfer& rt = remote_transfers_.at(route.lane_idx);
-        void* gray8_dst = rt.gray8_staging[static_cast<size_t>(slot_index)];
-
-        if (rt.peer_ok) {
-            // Each lane uses its own destination ConvertStream, so P2P copy
-            // and conversion for lane 1 and lane 2 can progress concurrently.
-            cudaSetDevice(lane->gpu_id());
-            cudaMemcpyPeerAsync(gray8_dst, lane->gpu_id(),
-                                xi_gpu_ptr, cfg_.capture_gpu_id,
-                                gray8_size_, lane->ConvertStream());
-        } else {
-            // Each remote lane owns a separate capture-side stream. D2H work
-            // therefore does not serialize between the two 5070 pipelines.
-            cudaSetDevice(cfg_.capture_gpu_id);
-            cudaMemcpyAsync(rt.pinned_staging[static_cast<size_t>(slot_index)], xi_gpu_ptr,
-                            gray8_size_, cudaMemcpyDeviceToHost, rt.capture_stream);
-            cudaEventRecord(rt.xfer_events[static_cast<size_t>(slot_index)], rt.capture_stream);
-
-            cudaSetDevice(lane->gpu_id());
-            cudaStreamWaitEvent(lane->ConvertStream(),
-                                rt.xfer_events[static_cast<size_t>(slot_index)], 0);
-            cudaMemcpyAsync(gray8_dst, rt.pinned_staging[static_cast<size_t>(slot_index)],
-                            gray8_size_, cudaMemcpyHostToDevice, lane->ConvertStream());
-        }
-
-        cudaSetDevice(lane->gpu_id());
-        convert_gray8_to_nv12_gpu(static_cast<const uint8_t*>(gray8_dst),
-                                   static_cast<uint8_t*>(nv12_dst), cfg_.width, cfg_.height,
-                                   lane->ConvertStream());
-    }
-
-    bool force_idr = route.needs_idr;
+    const bool force_idr = route.needs_idr;
     lane->SubmitSlot(slot_index, gop_index, source_index, pts_ns, force_idr);
     route.needs_idr = false;
     frames_submitted_.fetch_add(1, std::memory_order_relaxed);
