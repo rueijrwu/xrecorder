@@ -19,9 +19,6 @@ struct XimeaTelemetry {
     uint64_t rec_dropped = 0;
     uint32_t rec_queue = 0;
     uint64_t prev_displayed = 0;
-
-    // Populated only when the multi-lane NVENC recorder (codec == "h264")
-    // is active; see RECORD.md "Telemetry".
     uint64_t rec_cross_gpu_frames = 0;
     uint64_t rec_pending_gops = 0;
     uint64_t rec_gop_gaps = 0;
@@ -30,27 +27,28 @@ struct XimeaTelemetry {
 };
 
 struct CameraConfig {
-    int width = 4096;
-    int height = 996;
+    int width = 2048;
+    int height = 1024;
     int exposure_us = 900;
-    float gain_db = -1.0f; // -1 for max
+    float gain_db = -1.0f;
     int offset_x = 0;
-    int offset_y = 0;
-    int gpu_id = 0;  // Must identify the XIMEA GPUDirect-capable GPU (RTX PRO 2000 in target rig)
+    int offset_y = 1040;
+    int gpu_id = 0;
 };
 
 struct LaneConfig {
     int gpu_id = 0;
-    double weight = 1.0;  // relative sustained encode capacity for GOP scheduling
+    double weight = 1.0;
 };
 
 struct RecorderConfig {
+    // Group-of-frames size. Capture frames are accumulated into this logical
+    // group and the completed/active group is routed as one scheduling unit to
+    // one encoder lane. The same value is used for the independently decodable
+    // H.264 GOP produced by that lane.
     int gop_size = 30;
     int pool_size_per_lane = 48;
     uint32_t max_queue_depth = 16;
-    // Empty => XimeaManager builds the target topology: one local lane on
-    // the capture/RTX PRO GPU and two remote lanes on the second/5070 Ti GPU.
-    // Override explicitly with --lane-gpus if CUDA device enumeration differs.
     std::vector<LaneConfig> lanes;
 };
 
@@ -74,14 +72,14 @@ public:
 
 private:
     std::unique_ptr<XimeaCapture> camera_;
-    std::unique_ptr<GstRecorder> recorder_;         // used for codec != h264 (raw/h265/av1)
-    std::unique_ptr<MultiNvRecorder> multi_recorder_;  // used for codec == h264
+    std::unique_ptr<GstRecorder> recorder_;
+    std::unique_ptr<MultiNvRecorder> multi_recorder_;
     std::unique_ptr<GstPreviewer> previewer_;
 
     std::atomic<bool> is_running_{false};
-    std::atomic<bool> is_recording_{false};      // true when active recording to disk
-    std::atomic<int>  recording_index_{0};       // suffix for filename_idx.mp4
-    std::atomic<bool> stop_done_{false};         // ensures Stop() executes exactly once
+    std::atomic<bool> is_recording_{false};
+    std::atomic<int>  recording_index_{0};
+    std::atomic<bool> stop_done_{false};
     int save_fps_ = 1000;
     int display_fps_ = 60;
     std::string codec_ = "h264";
