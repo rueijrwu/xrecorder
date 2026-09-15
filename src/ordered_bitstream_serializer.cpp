@@ -1,11 +1,19 @@
 #define GST_USE_UNSTABLE_API
 #include "ordered_bitstream_serializer.h"
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <sstream>
 
 #include "time_utils.h"
+
+namespace {
+uint32_t ExpectedChunks(const OrderedBitstreamSerializer::GopBuffer& buf) {
+    if (!buf.expected_set) return 0;
+    return (buf.nominal_expected > buf.dropped) ? (buf.nominal_expected - buf.dropped) : 0;
+}
+}  // namespace
 
 OrderedBitstreamSerializer::OrderedBitstreamSerializer(const Config& cfg) : cfg_(cfg) {}
 
@@ -119,18 +127,21 @@ void OrderedBitstreamSerializer::SetGopExpectedCount(uint64_t gop_index, uint32_
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto& buf = pending_[gop_index];
-        buf.expected = count;
-        if (buf.chunks.empty() && buf.first_seen_us == 0) buf.first_seen_us = now_us();
+        buf.nominal_expected = count;
+        buf.expected_set = true;
+        if (buf.first_seen_us == 0) buf.first_seen_us = now_us();
     }
     cv_.notify_one();
 }
 
-void OrderedBitstreamSerializer::NotifyFrameDropped(uint64_t gop_index) {
+void OrderedBitstreamSerializer::NotifyFramesDropped(uint64_t gop_index, uint32_t count) {
+    if (count == 0) return;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto& buf = pending_[gop_index];
-        if (buf.expected > 0) buf.expected--;
-        if (buf.chunks.empty() && buf.first_seen_us == 0) buf.first_seen_us = now_us();
+        buf.dropped += count;
+        if (buf.first_seen_us == 0) buf.first_seen_us = now_us();
+        frame_gaps_.fetch_add(count, std::memory_order_relaxed);
     }
     cv_.notify_one();
 }
@@ -139,7 +150,7 @@ void OrderedBitstreamSerializer::PushChunk(EncodedChunk&& chunk) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         auto& buf = pending_[chunk.gop_index];
-        if (buf.chunks.empty() && buf.first_seen_us == 0) buf.first_seen_us = now_us();
+        if (buf.first_seen_us == 0) buf.first_seen_us = now_us();
         buf.chunks.push_back(std::move(chunk));
     }
     cv_.notify_one();
@@ -177,21 +188,25 @@ void OrderedBitstreamSerializer::EmitLoop() {
             cv_.wait_for(lock, std::chrono::milliseconds(100), [this] {
                 if (!keep_running_) return true;
                 auto it = pending_.find(next_expected_gop_);
-                if (it == pending_.end()) return false;
-                // expected==0 (every frame of this GOP was dropped) must
-                // count as complete immediately, not stall for the timeout.
-                return it->second.chunks.size() >= it->second.expected;
+                if (it == pending_.end() || !it->second.expected_set) return false;
+                return it->second.chunks.size() >= ExpectedChunks(it->second);
             });
 
             auto it = pending_.find(next_expected_gop_);
             if (it != pending_.end()) {
-                bool complete = it->second.chunks.size() >= it->second.expected;
-                bool stalled =
+                uint32_t expected = ExpectedChunks(it->second);
+                bool complete = it->second.expected_set && it->second.chunks.size() >= expected;
+                bool stalled = it->second.first_seen_us != 0 &&
                     now_us() - it->second.first_seen_us > cfg_.stall_timeout_ms * 1000ULL;
+
                 if (complete || stalled || !keep_running_) {
-                    if (!complete && it->second.expected > it->second.chunks.size()) {
-                        frame_gaps_.fetch_add(it->second.expected - it->second.chunks.size(),
-                                               std::memory_order_relaxed);
+                    // Explicit camera/application drops are already included in
+                    // frame_gaps_. Only add chunks that disappeared after they
+                    // were expected to reach the encoder/serializer.
+                    if (!complete && it->second.expected_set &&
+                        expected > it->second.chunks.size()) {
+                        frame_gaps_.fetch_add(expected - it->second.chunks.size(),
+                                              std::memory_order_relaxed);
                     }
                     if (!complete) gop_gaps_.fetch_add(1, std::memory_order_relaxed);
                     to_emit = std::move(it->second.chunks);
@@ -199,10 +214,12 @@ void OrderedBitstreamSerializer::EmitLoop() {
                     next_expected_gop_++;
                     have_gop = true;
                 }
-            } else if (!pending_.empty() && (now_us() - pending_.begin()->second.first_seen_us >
-                                              cfg_.stall_timeout_ms * 1000ULL || !keep_running_)) {
-                // Next expected GOP never arrived at all (e.g. whole GOP
-                // dropped) — skip forward to the oldest buffered GOP.
+            } else if (!pending_.empty() &&
+                       (now_us() - pending_.begin()->second.first_seen_us >
+                            cfg_.stall_timeout_ms * 1000ULL ||
+                        !keep_running_)) {
+                // A GOP with no registration at all indicates a pipeline logic
+                // failure; skip forward rather than block the recording forever.
                 gop_gaps_.fetch_add(1, std::memory_order_relaxed);
                 next_expected_gop_ = pending_.begin()->first;
                 continue;
@@ -212,6 +229,10 @@ void OrderedBitstreamSerializer::EmitLoop() {
         }
 
         if (have_gop) {
+            std::sort(to_emit.begin(), to_emit.end(),
+                      [](const EncodedChunk& a, const EncodedChunk& b) {
+                          return a.source_index < b.source_index;
+                      });
             for (const auto& chunk : to_emit) EmitChunk(chunk);
         }
     }
