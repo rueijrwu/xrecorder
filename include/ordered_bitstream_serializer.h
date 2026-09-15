@@ -17,14 +17,16 @@
 
 // Consumes EncodedChunk objects arriving out of order from up to N
 // EncoderLanes and re-emits them strictly in source order, one whole GOP at
-// a time, into a single final mux/filesink pipeline (RECORD.md "Encoder
-// pipeline design" / "Scheduler").
+// a time, into a single final mux/filesink pipeline.
 //
-// A GOP is "ready" once it has received `expected` chunks (registered by
-// the caller when the GOP is assigned to a lane). If a GOP stalls for
-// longer than `stall_timeout_ms` (e.g. a lane died) it is force-flushed
-// with whatever was received, and the gap is counted in telemetry rather
-// than blocking the whole recording forever.
+// A GOP has a nominal frame count and an explicit drop count. This matters
+// because acq_nframe can expose camera-side gaps before the GOP's first actual
+// frame arrives. Completion is therefore based on:
+//
+//   expected_chunks = nominal_expected - dropped
+//
+// rather than mutating a single expected counter whose initialization order
+// can race with drop notification.
 class OrderedBitstreamSerializer {
 public:
     using ErrorCallback = std::function<void(const std::string& error_msg)>;
@@ -52,14 +54,14 @@ public:
     bool Start(ErrorCallback error_cb = nullptr);
     void Stop();
 
-    // Must be called once, before any frame of `gop_index` is submitted to
-    // its lane, with the nominal frame count for that GOP. May be called
-    // again later with a smaller count to finalize a short trailing GOP.
+    // Register the nominal source-frame count for a GOP. Repeated calls are
+    // safe and preserve any drop notifications that arrived earlier.
     void SetGopExpectedCount(uint64_t gop_index, uint32_t count);
 
-    // Called when a frame belonging to gop_index was dropped instead of
-    // handed to a lane, so the completion count stays reachable.
-    void NotifyFrameDropped(uint64_t gop_index);
+    // Register one or more source frames that will never produce an encoded
+    // chunk (camera-side acq_nframe gap or application-side drop).
+    void NotifyFramesDropped(uint64_t gop_index, uint32_t count = 1);
+    void NotifyFrameDropped(uint64_t gop_index) { NotifyFramesDropped(gop_index, 1); }
 
     // Thread-safe; called concurrently from every EncoderLane's pull thread.
     void PushChunk(EncodedChunk&& chunk);
@@ -69,7 +71,9 @@ public:
 private:
     struct GopBuffer {
         std::vector<EncodedChunk> chunks;
-        uint32_t expected = 0;
+        uint32_t nominal_expected = 0;
+        uint32_t dropped = 0;
+        bool expected_set = false;
         uint64_t first_seen_us = 0;
     };
 
