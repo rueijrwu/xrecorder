@@ -27,6 +27,7 @@ set(XIMEA_INCLUDE_DIR "/usr/include")
 set(XIMEA_LIB_DIR "/opt/XIMEA/lib")
 
 include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${GST_INCLUDE_DIRS}
     ${XIMEA_INCLUDE_DIR}
@@ -34,13 +35,17 @@ include_directories(
 
 # 1. Library target
 add_library(ximea_core STATIC
-    ximea_capture.cpp
-    gst_recorder.cpp
-    gst_previewer.cpp
-    ximea_manager.cpp
-    cuda_utils.cu
+    src/ximea_capture.cpp
+    src/gst_recorder.cpp
+    src/gst_previewer.cpp
+    src/ximea_manager.cpp
+    src/cuda_utils.cu
 )
 set_target_properties(ximea_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+target_include_directories(ximea_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 
 target_link_libraries(ximea_core
     PUBLIC
@@ -53,7 +58,7 @@ target_link_libraries(ximea_core
 )
 
 # 2. CLI App target
-add_executable(ximea_cli main.cpp)
+add_executable(ximea_cli src/main.cpp)
 target_link_libraries(ximea_cli
     PRIVATE
     ximea_core
@@ -64,7 +69,7 @@ target_link_libraries(ximea_cli
 target_link_options(ximea_cli PRIVATE "LINKER:--no-as-needed" "LINKER:--export-dynamic")
 
 # 3. Python Module target
-pybind11_add_module(ximea_py bindings.cpp)
+pybind11_add_module(ximea_py python/binding/bindings.cpp)
 target_link_libraries(ximea_py 
     PRIVATE 
     ximea_core
@@ -73,7 +78,7 @@ target_link_libraries(ximea_py
 target_link_options(ximea_py PRIVATE "LINKER:--no-as-needed")
 
 # 4. Example Usage target
-add_executable(ximea_cpp_example example_usage.cpp)
+add_executable(ximea_cpp_example src/example_usage.cpp)
 target_link_libraries(ximea_cpp_example
     PRIVATE
     ximea_core
