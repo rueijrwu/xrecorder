@@ -97,8 +97,8 @@ int main(int argc, char* argv[]) {
                    "Comma-separated GPU id per NVENC lane. Empty = auto-detect target topology.")
         ->default_val("");
     app.add_option("--gop-size", rec_cfg.gop_size,
-                   "Frames per capture group-of-frames buffer and independently-decodable encoder GOP. "
-                   "Each group is routed as one unit to one NVENC pipeline.")
+                   "Frames per logical capture FrameGroup and independently-decodable encoder GOP. "
+                   "All frames in a group are routed to the same NVENC pipeline and processed immediately as they arrive; no whole-group prebuffer is used.")
         ->default_val(30);
     app.add_option("--lane-pool-size", rec_cfg.pool_size_per_lane,
                    "Bounded NV12/GRAY8 frame slots preallocated per NVENC lane")
@@ -123,7 +123,7 @@ int main(int argc, char* argv[]) {
                   << "Hz, ROI offset=(" << cam_cfg.offset_x << "," << cam_cfg.offset_y << ")"
                   << ", Exposure: " << cam_cfg.exposure_us << "us, Gain: " << cam_cfg.gain_db
                   << "dB" << std::endl;
-        std::cout << "Capture group/GOP size: " << rec_cfg.gop_size << " frames" << std::endl;
+        std::cout << "Logical FrameGroup/H.264 GOP size: " << rec_cfg.gop_size << " frames" << std::endl;
 
         auto error_handler = [](const std::string& msg) {
             std::lock_guard<std::mutex> lock(g_cout_mutex);
