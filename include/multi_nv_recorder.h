@@ -17,15 +17,16 @@
 
 // Top-level multi-lane NVENC recorder.
 //
-// Execution model:
-//   1) XIMEA RDMA lands one frame in RTX PRO VRAM.
-//   2) Capture path copies that frame into lane-owned GRAY8 memory.
-//   3) Capture synchronizes ONLY that ownership copy.
-//   4) The selected lane's independent process stream converts GRAY8->NV12
-//      and feeds its independent NVENC pipeline while capture continues.
+// gop_size defines a LOGICAL FrameGroup interval and the matching H.264 GOP.
+// It is not a physical prebuffer: frames stream into the selected lane as soon
+// as each ownership copy completes. The first actual frame of a FrameGroup
+// selects the lane; all later frames in that source-index interval use the same
+// route. This preserves low latency while keeping one encoder reference history
+// per independently decodable GOP.
 //
-// Therefore the intended steady state is four concurrently progressing paths:
-//   capture/RDMA+copy + PRO pipeline + 5070 lane A + 5070 lane B.
+// Execution model:
+//   capture/RDMA + ownership copy
+//   + three concurrently progressing lane process/NVENC pipelines.
 class MultiNvRecorder {
 public:
     using ErrorCallback = std::function<void(const std::string& error_msg)>;
@@ -38,10 +39,10 @@ public:
 
     struct Config {
         int capture_gpu_id = 0;
-        int width = 4096;
-        int height = 992;
+        int width = 2048;
+        int height = 1024;
         int fps = 1000;
-        int gop_size = 30;
+        int gop_size = 30;  // logical FrameGroup size + encoder GOP size
         int pool_size_per_lane = 48;
         uint32_t max_queue_depth = 16;
         uint32_t stall_timeout_ms = 2000;
@@ -67,10 +68,9 @@ public:
     void Stop();
     void SetOutputName(const std::string& name) { output_name_ = name; }
 
-    // Called from the XIMEA capture callback. acq_nframe is authoritative.
-    // This function waits only until the XiAPI RDMA source frame has been
-    // copied into the selected lane's application-owned GRAY8 slot. It never
-    // waits for conversion or NVENC completion.
+    // One frame enters its logical FrameGroup and is processed immediately.
+    // Capture waits only for ownership copy, never for the rest of the group,
+    // conversion, or NVENC completion.
     void PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us, uint32_t acq_nframe);
 
     Stats GetStats() const;
@@ -79,29 +79,15 @@ private:
     struct LaneTransfer {
         int gpu_id = -1;
         bool peer_ok = false;
-
-        // Every lane, including the local PRO lane, owns a GRAY8 ring. The
-        // XiAPI pointer is never consumed directly by a process pipeline.
         std::vector<void*> gray8_staging;
-
-        // Per-slot event recorded when ownership copy into gray8_staging is
-        // complete. Capture synchronizes only this event.
         std::vector<cudaEvent_t> copy_done_events;
-
-        // Copy stream lives on the lane/destination GPU. Local PRO uses D2D;
-        // remote 5070 lanes use P2P on this stream.
         cudaStream_t copy_stream = nullptr;
-
-        // Only used if direct CUDA P2P is unavailable. D2H is issued on a
-        // dedicated capture-GPU stream, then this lane's copy_stream performs
-        // H2D. These resources are per lane so the two 5070 pipelines never
-        // serialize through one fallback stream.
         std::vector<void*> pinned_staging;
         std::vector<cudaEvent_t> d2h_done_events;
         cudaStream_t capture_stream = nullptr;
     };
 
-    struct GopRoute {
+    struct FrameGroupRoute {
         int lane_idx = -1;
         bool needs_idr = true;
     };
@@ -118,8 +104,6 @@ private:
     std::unique_ptr<GopScheduler> scheduler_;
     std::unique_ptr<OrderedBitstreamSerializer> serializer_;
 
-    // Keyed by lane_id. Each lane has independent GRAY8 ownership and copy
-    // streams even when two lanes share the same RTX 5070 Ti.
     std::map<int, LaneTransfer> lane_transfers_;
     size_t gray8_size_ = 0;
 
@@ -127,14 +111,13 @@ private:
     std::atomic<bool> started_{false};
     mutable std::mutex stop_mutex_;
 
-    // Capture-thread-only sequence state. last_source_index_ advances by the
-    // unsigned acq_nframe delta, preserving XiAPI gaps and uint32 wrap.
     bool have_acq_sequence_ = false;
     uint32_t last_acq_nframe_ = 0;
     uint64_t last_source_index_ = 0;
     uint64_t first_ts_us_ = 0;
 
-    std::map<uint64_t, GopRoute> gop_routes_;
+    // group_index -> fixed route for the entire logical FrameGroup.
+    std::map<uint64_t, FrameGroupRoute> frame_group_routes_;
 
     std::atomic<uint64_t> frames_submitted_{0};
     std::atomic<uint64_t> frames_dropped_{0};
