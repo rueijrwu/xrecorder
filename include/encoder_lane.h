@@ -93,6 +93,7 @@ private:
     void PushLoop();
     void PullLoop();
     void RequestKeyframe();
+    void VerifyEncoderDevice();
     void ReleaseSlot(int index);
     static gboolean on_bus_message(GstBus* bus, GstMessage* msg, gpointer user_data);
 

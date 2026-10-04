@@ -85,7 +85,7 @@ int main(int argc, char* argv[]) {
         ->default_val("h264");
 
     app.add_option("--width", cam_cfg.width, "Camera width")->default_val(2048);
-    app.add_option("--height", cam_cfg.height, "Camera height")->default_val(1024);
+    app.add_option("--height", cam_cfg.height, "Camera height")->default_val(992);
     app.add_option("-e,--exposure", cam_cfg.exposure_us, "Exposure time (us)")->default_val(900);
     app.add_option("-g,--gain", cam_cfg.gain_db, "Gain (dB), -1 for max")->default_val(-1.0f);
     app.add_option("--offset-x", cam_cfg.offset_x, "ROI X offset")->default_val(0);

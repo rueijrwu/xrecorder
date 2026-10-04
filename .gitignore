@@ -2,3 +2,9 @@ build
 
 .claude
 .arbor
+
+__pycache__/
+*.pyc
+exp1
+exp2
+documents

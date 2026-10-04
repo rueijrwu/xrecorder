@@ -60,8 +60,16 @@ bool EncoderLane::Start(ChunkCallback chunk_cb, ErrorCallback error_cb) {
     ss << "appsrc name=mysrc caps=\"video/x-raw(memory:CUDAMemory), format=NV12, width="
        << cfg_.width << ", height=" << cfg_.height << ", framerate=" << cfg_.fps << "/1\" ! "
        << "queue max-size-buffers=" << cfg_.pool_size << " max-size-bytes=0 max-size-time=0 ! "
-       << "nvh264enc name=enc cuda-device-id=" << cfg_.gpu_id
-       << " preset=p1 rc-mode=cbr gop-size=" << cfg_.gop_size
+       // nvh264enc/nvh264device<N>enc hardcode their GPU at registration time
+       // and expose cuda-device-id read-only, so setting it there is silently
+       // ignored (GLib-GObject-CRITICAL) and every lane ends up on GStreamer
+       // CUDA device 0. Buffers whose GstCudaContext lives on another device
+       // then round-trip through system memory inside the encoder on every
+       // frame. nvautogpuh264enc takes the GPU from the upstream CUDA context
+       // -- which is exactly this lane's context -- and its cuda-device-id is
+       // writable as an explicit fallback.
+       << "nvautogpuh264enc name=enc cuda-device-id=" << cfg_.gpu_id
+       << " preset=p1 tune=ultra-low-latency rc-mode=cbr gop-size=" << cfg_.gop_size
        << " bitrate=" << cfg_.bitrate_kbps
        << " bframes=0 rc-lookahead=0 zerolatency=true ! "
        << "h264parse config-interval=-1 ! "
@@ -184,14 +192,22 @@ void EncoderLane::Stop() {
 }
 
 void* EncoderLane::ReserveSlot(int* out_slot_index) {
-    int idx = next_slot_.fetch_add(1, std::memory_order_relaxed) % cfg_.pool_size;
-    if (slot_in_use_[idx].load(std::memory_order_acquire)) {
-        dropped_.fetch_add(1, std::memory_order_relaxed);
-        return nullptr;
+    // Probe the whole pool rather than a single round-robin candidate: slots
+    // are released out of order (GStreamer unrefs encoded buffers whenever
+    // NVENC retires them), so one busy slot does not mean the lane is full.
+    const int start = next_slot_.fetch_add(1, std::memory_order_relaxed);
+    for (int i = 0; i < cfg_.pool_size; ++i) {
+        const int idx = (start + i) % cfg_.pool_size;
+        bool expected = false;
+        if (slot_in_use_[idx].compare_exchange_strong(expected, true,
+                                                       std::memory_order_acq_rel,
+                                                       std::memory_order_relaxed)) {
+            *out_slot_index = idx;
+            return nv12_pool_[idx];
+        }
     }
-    slot_in_use_[idx].store(true, std::memory_order_release);
-    *out_slot_index = idx;
-    return nv12_pool_[idx];
+    dropped_.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
 }
 
 void EncoderLane::SubmitSlot(int slot_index, uint64_t gop_index, uint64_t source_index,
@@ -214,6 +230,33 @@ void EncoderLane::RequestKeyframe() {
     if (!pipeline_) return;
     gst_element_send_event(pipeline_,
                             gst_video_event_new_upstream_force_key_unit(GST_CLOCK_TIME_NONE, TRUE, 0));
+}
+
+void EncoderLane::VerifyEncoderDevice() {
+    // nvautogpuh264enc resolves its GPU from the upstream CUDA context, so
+    // cuda-device-id is only a fallback. Read the resolved value back once: a
+    // lane encoding on a GPU other than the one holding its NV12 pool silently
+    // round-trips every frame through system memory, which is exactly the
+    // failure this element replaced.
+    //
+    // This runs on the pull thread after the first encoded frame, when the
+    // encoder is fully negotiated. It must never run on Start()'s caller: that
+    // is the previewer's GMainLoop thread, and blocking it there freezes the
+    // preview window and its keyboard handling.
+    if (!pipeline_) return;
+    GstElement* enc = gst_bin_get_by_name(GST_BIN(pipeline_), "enc");
+    if (!enc) return;
+
+    guint actual_gpu = 0;
+    g_object_get(G_OBJECT(enc), "cuda-device-id", &actual_gpu, NULL);
+    if (static_cast<int>(actual_gpu) != cfg_.gpu_id) {
+        std::cerr << "\nEncoderLane[" << cfg_.lane_id
+                  << "]: WARNING encoder resolved to CUDA device " << actual_gpu
+                  << " but the lane's frame pool lives on device " << cfg_.gpu_id
+                  << "; every frame will be staged through system memory."
+                  << std::endl;
+    }
+    gst_object_unref(enc);
 }
 
 void EncoderLane::PushLoop() {
@@ -304,7 +347,9 @@ void EncoderLane::PullLoop() {
             }
         }
 
-        completed_.fetch_add(1, std::memory_order_relaxed);
+        if (completed_.fetch_add(1, std::memory_order_relaxed) == 0) {
+            VerifyEncoderDevice();
+        }
         gst_sample_unref(sample);
         if (chunk_callback_) chunk_callback_(std::move(chunk));
     }

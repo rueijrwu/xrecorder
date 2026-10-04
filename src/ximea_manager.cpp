@@ -32,19 +32,51 @@ bool XimeaManager::Initialize(int save_fps, int display_fps, const std::string& 
     codec_ = codec;
     rec_cfg_ = rec_cfg;
 
+    // Resolve the capture GPU before lane planning. XiAPI GPUDirect RDMA
+    // (XI_TRANSPORT_DATA_TARGET_GPU_RAM) only works on RDMA-capable GPUs --
+    // NVIDIA does not enable it on GeForce parts, where xiStartAcquisition
+    // fails with 116 / XI_GPUDIRECT_NOT_AVAILABLE. CUDA's default
+    // FASTEST_FIRST ordering does not keep the capable card at a fixed device
+    // id across driver updates, so detect it rather than trusting the default.
+    int device_count = 0;
+    cudaGetDeviceCount(&device_count);
+    int capture_gpu = cam_cfg.gpu_id;
+    if (capture_gpu < 0 || capture_gpu >= device_count) {
+        std::cerr << "XimeaManager: invalid capture GPU id " << capture_gpu
+                  << "; use --capture-gpu to select the RTX PRO 2000." << std::endl;
+        return false;
+    }
+
+    int rdma_supported = 0;
+    cudaDeviceGetAttribute(&rdma_supported, cudaDevAttrGPUDirectRDMASupported, capture_gpu);
+    if (!rdma_supported) {
+        int rdma_gpu = -1;
+        for (int i = 0; i < device_count; ++i) {
+            int cap = 0;
+            cudaDeviceGetAttribute(&cap, cudaDevAttrGPUDirectRDMASupported, i);
+            if (cap) {
+                rdma_gpu = i;
+                break;
+            }
+        }
+        if (rdma_gpu < 0) {
+            std::cerr << "XimeaManager: no CUDA device reports GPUDirect RDMA support; "
+                         "GPU_RAM transport cannot work on this host." << std::endl;
+            return false;
+        }
+        cudaDeviceProp prop{};
+        cudaGetDeviceProperties(&prop, rdma_gpu);
+        std::cerr << "XimeaManager: CUDA device " << capture_gpu
+                  << " does not support GPUDirect RDMA; using device " << rdma_gpu
+                  << " (" << prop.name << ") as the capture GPU instead." << std::endl;
+        capture_gpu = rdma_gpu;
+    }
+
     if (rec_cfg_.lanes.empty()) {
         // Target rig topology after GPUDirect audit:
         //   capture GPU = RTX PRO 2000 (XIMEA GPUDirect landing GPU, 1 NVENC)
         //   other GPU   = RTX 5070 Ti (2 NVENC engines)
         // Thus the default is one local lane plus two remote lanes.
-        int device_count = 0;
-        cudaGetDeviceCount(&device_count);
-        int capture_gpu = cam_cfg.gpu_id;
-        if (capture_gpu < 0 || capture_gpu >= device_count) {
-            std::cerr << "XimeaManager: invalid capture GPU id " << capture_gpu
-                      << "; use --capture-gpu to select the RTX PRO 2000." << std::endl;
-            return false;
-        }
         if (device_count >= 2) {
             int other_gpu = -1;
             for (int i = 0; i < device_count; ++i) {
@@ -66,7 +98,7 @@ bool XimeaManager::Initialize(int save_fps, int display_fps, const std::string& 
     camera_->SetExposure(cam_cfg.exposure_us);
     camera_->SetGain(cam_cfg.gain_db);
     camera_->SetOffsets(cam_cfg.offset_x, cam_cfg.offset_y);
-    camera_->SetGpuId(cam_cfg.gpu_id);
+    camera_->SetGpuId(capture_gpu);
 
     if (!camera_->Open()) {
         std::cerr << "XimeaManager: Failed to open camera." << std::endl;

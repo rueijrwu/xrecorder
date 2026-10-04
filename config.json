@@ -1,0 +1,52 @@
+{
+  "system": {
+    "enable_debug_outputs": true,
+    "enable_telemetry": true
+  },
+  "pipeline": {
+    "image_process": {
+      "static": {
+        "frame_width": 2048,
+        "frame_height": 1024,
+        "downsample_factor": 8,
+        "cuda_device": 0,
+        "enable_hough_pupil_seed": true,
+        "hough_radius_min_ratio": 0.6,
+        "hough_radius_max_ratio": 1.25,
+        "hough_center_roi_margin_ratio": 0.15,
+        "hough_center_vote_threshold": 5,
+        "hough_radius_vote_threshold": 5,
+        "hough_max_circles": 3,
+        "hough_radius_bin_step": 8,
+        "hough_accumulator_dp": 1.0,
+        "ransac_inlier_threshold": 16.0,
+        "ransac_min_major": 500.0,
+        "ransac_max_major": 2000.0,
+        "ransac_min_aspect": 0.925,
+        "lm_max_iterations": 16,
+        "lm_convergence_threshold": 0.0001,
+        "starburst_threshold_ratio": 1.0,
+        "starburst_roi_half_size": 32,
+        "starburst_search_span": 32,
+        "ellipse_refine_half_window": 15,
+        "pupil_max_hole_area": 2500,
+        "p1_roi_size": 64,
+        "loc_min_sigma": 0.5,
+        "p1_loc_threshold": 220,
+        "p4_roi_size": 64,
+        "p4_localization_threshold": 70
+      },
+      "params": {
+        "pupil_gain": 1.0,
+        "p1_threshold": 200.0,
+        "p1_min_area": 4,
+        "p1_max_area": 100,
+        "p1_max_aspect": 2.0,
+        "p4_offset": 2.0,
+        "p4_min_area": 4,
+        "p4_max_area": 40,
+        "p4_max_aspect": 5.0
+      }
+    }
+  }
+}

@@ -104,9 +104,11 @@ void MultiNvRecorder::SetupLaneTransfer(int lane_id, int lane_gpu_id) {
         }
     }
 
+    cudaDeviceProp lane_prop{};
+    cudaGetDeviceProperties(&lane_prop, lane_gpu_id);
     std::cout << "MultiNvRecorder: lane " << lane_id
               << " copy path capture_gpu=" << cfg_.capture_gpu_id
-              << " -> lane_gpu=" << lane_gpu_id;
+              << " -> lane_gpu=" << lane_gpu_id << " (" << lane_prop.name << ")";
     if (local) {
         std::cout << " uses local D2D ownership copy";
     } else if (transfer.peer_ok) {
@@ -271,6 +273,14 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
     const bool local = (lane->gpu_id() == cfg_.capture_gpu_id);
     cudaError_t copy_submit = cudaSuccess;
 
+    // The capture thread must block until nothing is still reading xi_gpu_ptr,
+    // because XiAPI recycles that RDMA buffer a few frames later. It must NOT
+    // block on anything after that read. `capture_read_done` is therefore the
+    // event that retires the read of the XiAPI buffer, while `copy_done`
+    // retires the write into gray8_dst and is consumed by the lane's convert
+    // stream asynchronously.
+    cudaEvent_t capture_read_done = copy_done;
+
     if (local) {
         cudaSetDevice(cfg_.capture_gpu_id);
         copy_submit = cudaMemcpyAsync(gray8_dst, xi_gpu_ptr, gray8_size_,
@@ -300,6 +310,7 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
             copy_submit = cudaEventRecord(
                 transfer.d2h_done_events[static_cast<size_t>(slot_index)],
                 transfer.capture_stream);
+            capture_read_done = transfer.d2h_done_events[static_cast<size_t>(slot_index)];
         }
 
         if (copy_submit == cudaSuccess) {
@@ -331,10 +342,11 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
         return;
     }
 
-    // The only capture-side synchronization. We never wait for completion of
-    // the rest of the logical FrameGroup, conversion, or NVENC.
-    cudaSetDevice(lane->gpu_id());
-    cudaError_t copy_status = cudaEventSynchronize(copy_done);
+    // The only capture-side synchronization: wait for the XiAPI source buffer
+    // to be released, nothing else. On the pinned-host fallback path this is
+    // the device-to-host leg only; the host-to-device leg, the conversion, and
+    // NVENC all continue asynchronously behind the stream dependency below.
+    cudaError_t copy_status = cudaEventSynchronize(capture_read_done);
     if (copy_status != cudaSuccess) {
         lane->CancelReservedSlot(slot_index);
         frames_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -345,6 +357,10 @@ void MultiNvRecorder::PushFrame(void* xi_gpu_ptr, uint64_t timestamp_us,
         }
         return;
     }
+
+    // Order the conversion behind the ownership copy without blocking here.
+    cudaSetDevice(lane->gpu_id());
+    cudaStreamWaitEvent(lane->ConvertStream(), copy_done, 0);
 
     convert_gray8_to_nv12_gpu(static_cast<const uint8_t*>(gray8_dst),
                                static_cast<uint8_t*>(nv12_dst),

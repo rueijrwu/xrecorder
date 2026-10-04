@@ -26,6 +26,13 @@ find_package(pybind11 REQUIRED)
 set(XIMEA_INCLUDE_DIR "/usr/include") 
 set(XIMEA_LIB_DIR "/opt/XIMEA/lib")
 
+# Set RPATH so runtime binaries can find shared libraries like libm3api.so
+set(CMAKE_BUILD_RPATH "${XIMEA_LIB_DIR}" "/usr/local/lib64")
+set(CMAKE_INSTALL_RPATH "${XIMEA_LIB_DIR}" "/usr/local/lib64")
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+add_compile_definitions(GST_USE_UNSTABLE_API)
+
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
